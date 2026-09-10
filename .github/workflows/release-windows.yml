@@ -60,7 +60,12 @@ jobs:
           $tag = "v$version"
           git fetch --tags --force
 
-          if (git rev-parse -q --verify "refs/tags/$tag") {
+          $existingTag = git tag --list $tag
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to inspect existing Git tags."
+          }
+
+          if ($existingTag) {
             throw "Tag '$tag' already exists."
           }
 
@@ -112,7 +117,12 @@ jobs:
           $tag = "${{ steps.version.outputs.tag }}"
           git status --short
 
-          if (-not (git diff --quiet -- Cargo.toml Cargo.lock)) {
+          $changedFiles = git diff --name-only -- Cargo.toml Cargo.lock
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to inspect Cargo version changes."
+          }
+
+          if ($changedFiles) {
             git add Cargo.toml Cargo.lock
             git commit -m "Release $tag"
           } else {
