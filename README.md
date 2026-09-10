@@ -10,17 +10,34 @@ Chrome tab-title results.
 cargo run
 ```
 
-Press `Ctrl+Alt+Space` to open the overlay. Type to search, use Up/Down to move,
-Right Arrow to bring the selected window forward while keeping the switcher open,
-Left Arrow to move the selected window to the next screen,
-Ctrl+Right/Ctrl+Left to resize thumbnails, Ctrl+D to include windows and tabs
-from all virtual desktops, Ctrl+? to toggle matching installed apps, Enter to
-activate or launch the selected result and close the switcher, and Esc to close.
+Press `Ctrl+Alt+Space` to open the overlay, then type to search.
 
 When the app is running, it also adds a notification-area icon. Right-click that
 icon to toggle `Run at startup` or choose `Exit` to quit the application. The
 startup option writes a per-user Windows startup entry that launches the app
-with `--startup`. Click the icon to open the switcher.
+with `--startup`. Normal launches show a short splash screen; `--startup`
+launches quietly to the tray. Click the icon to open the switcher.
+
+## Keys
+
+| Key | What it does |
+| --- | --- |
+| `Ctrl+Alt+Space` | Open or hide the switcher overlay. |
+| Text input | Search window titles, Chrome tab titles, or app names in app mode. |
+| `Backspace` | Delete the last character in the search text. |
+| `Up` | Move selection up. |
+| `Down` | Move selection down. |
+| `Tab` | Move selection down. |
+| `Enter` | Activate the selected window/tab, or launch the selected app in app mode, then close the overlay. |
+| `Esc` | Close the overlay without quitting the app. |
+| `Right` | Bring the selected window/tab to the foreground while keeping the overlay open. |
+| `Left` | Move the selected window/tab parent, or matching running app window, to the next screen. |
+| `Ctrl+F` | Maximize the selected window, or restore it if it is already maximized. |
+| `Ctrl+W` | Close the selected window with the app's normal close behavior. |
+| `Ctrl+Right` | Increase thumbnail size. |
+| `Ctrl+Left` | Decrease thumbnail size. |
+| `Ctrl+D` | Toggle all-desktops mode for windows and tabs. |
+| `Ctrl+?` / `Ctrl+/` | Toggle app launcher mode while preserving the current search text. |
 
 ## Quality Checks
 
@@ -71,9 +88,10 @@ the tab result is shown and the duplicate browser-window result is hidden.
 ## App Launcher Mode
 
 While the overlay is open, press `Ctrl+?` (or `Ctrl+/`) to switch the current
-search into app launcher mode. The app scans the current-user and all-users
-Start Menu shortcuts, collapses duplicate app names, and launches the selected
-shortcut with Enter.
+search into app launcher mode. The app scans current-user and all-users Start
+Menu shortcuts, Windows App Paths, and packaged Windows apps from the Start app
+catalog. It collapses duplicate app names and launches the selected app with
+Enter.
 
 ## All Desktops Mode
 

@@ -22,7 +22,7 @@ use startup::{is_run_at_startup_enabled, set_run_at_startup};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::ffi::c_void;
+use std::ffi::{c_void, OsStr};
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::mem::size_of;
@@ -30,7 +30,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::rc::Rc;
-use std::thread::sleep;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime};
 use tray::{
     install_tray_icon, is_tray_context_event, is_tray_icon_message, is_tray_select_event,
@@ -78,24 +79,36 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, DrawIconEx,
     EnumWindows, GetClassNameW, GetClientRect, GetMessageW, GetShellWindow, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, LoadCursorW, LoadIconW, PostQuitMessage, RegisterClassW,
-    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, DI_NORMAL, GWLP_USERDATA, GWL_EXSTYLE, HICON,
-    HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW, IDI_APPLICATION, MSG, SET_WINDOW_POS_FLAGS,
-    SM_CXSCREEN, SM_CYSCREEN, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOW, WM_CHAR,
-    WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_PAINT, WM_RBUTTONUP, WM_SETICON, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    IsWindow, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadIconW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+    DI_NORMAL, GWLP_USERDATA, GWL_EXSTYLE, HICON, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW,
+    IDI_APPLICATION, MSG, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOMOVE, SWP_NOSIZE,
+    SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
+    WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONUP,
+    WM_SETICON, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const HOTKEY_ID: i32 = 0x4d57;
+const SPLASH_TIMER_ID: usize = 0x4d58;
+const CLOSE_REFRESH_TIMER_ID: usize = 0x4d59;
+const APP_SCAN_TIMER_ID: usize = 0x4d5a;
+const SPLASH_DURATION_MS: u32 = 2400;
+const CLOSE_REFRESH_POLL_MS: u32 = 250;
+const CLOSE_REFRESH_ATTEMPTS: u8 = 20;
+const APP_SCAN_POLL_MS: u32 = 100;
 const WM_MOUSELEAVE_MESSAGE: u32 = 0x02A3;
 const MAX_RESULTS: usize = 8;
-const HELP_LINES: [&str; 9] = [
+const KEY_F: u32 = b'F' as u32;
+const KEY_W: u32 = b'W' as u32;
+const HELP_LINES: [&str; 11] = [
     "Esc - close",
     "Up / Down - move selection",
     "Enter - select or launch",
     "Right - bring selected window to top",
     "Left - move selected window to next screen",
+    "Ctrl + F - maximize or restore selected window",
+    "Ctrl + W - close selected window",
     "Ctrl + Right - increase thumbnails",
     "Ctrl + Left - decrease thumbnails",
     "Ctrl + D - search all desktops",
@@ -123,6 +136,8 @@ const CLASS_NAME: PCWSTR = w!("MegaWinAltTabOverlay");
 const WINDOW_TITLE: PCWSTR = w!("Mega Win Alt Tab");
 
 pub fn run() -> Result<()> {
+    let startup_launch = has_startup_arg(env::args_os());
+
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
@@ -183,6 +198,10 @@ pub fn run() -> Result<()> {
             VK_SPACE.0 as u32,
         )?;
 
+        if !startup_launch {
+            (*raw_state).borrow_mut().show_splash();
+        }
+
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {
             let _ = TranslateMessage(&msg);
@@ -196,6 +215,7 @@ pub fn run() -> Result<()> {
 struct AppState {
     hwnd: HWND,
     visible: bool,
+    splash_visible: bool,
     mode: OverlayMode,
     all_desktops: bool,
     query: String,
@@ -209,11 +229,15 @@ struct AppState {
     help_rect: RECT,
     close_rect: RECT,
     apps: Vec<AppEntry>,
+    app_scan_completed: bool,
+    app_scan_rx: Option<Receiver<Vec<AppEntry>>>,
+    scan_apps_after_paint: bool,
     windows: Vec<WindowEntry>,
     accessibility_tabs: Vec<TabEntry>,
     results: Vec<SearchResult>,
     thumbnails: HashMap<isize, isize>,
     original_window_rects: HashMap<isize, RECT>,
+    pending_close_windows: HashMap<isize, u8>,
     row_layouts: Vec<RowLayout>,
     bridge: ExtensionBridge,
     tray_icon_installed: bool,
@@ -242,6 +266,7 @@ impl AppState {
         Self {
             hwnd: HWND(null_mut()),
             visible: false,
+            splash_visible: false,
             mode: OverlayMode::WindowsAndTabs,
             all_desktops: false,
             query: String::new(),
@@ -255,11 +280,15 @@ impl AppState {
             help_rect: RECT::default(),
             close_rect: RECT::default(),
             apps: Vec::new(),
+            app_scan_completed: false,
+            app_scan_rx: None,
+            scan_apps_after_paint: false,
             windows: Vec::new(),
             accessibility_tabs: Vec::new(),
             results: Vec::new(),
             thumbnails: HashMap::new(),
             original_window_rects: HashMap::new(),
+            pending_close_windows: HashMap::new(),
             row_layouts: Vec::new(),
             bridge,
             tray_icon_installed: false,
@@ -278,10 +307,13 @@ impl AppState {
 
     unsafe fn show(&mut self) {
         self.visible = true;
+        self.splash_visible = false;
+        let _ = KillTimer(self.hwnd, SPLASH_TIMER_ID);
         self.mode = OverlayMode::WindowsAndTabs;
         self.all_desktops = false;
         self.query.clear();
         self.selected = 0;
+        self.scan_apps_after_paint = !self.app_scan_completed && self.app_scan_rx.is_none();
         self.refresh();
 
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
@@ -307,8 +339,40 @@ impl AppState {
         let _ = InvalidateRect(self.hwnd, None, BOOL(1));
     }
 
+    unsafe fn show_splash(&mut self) {
+        self.visible = true;
+        self.splash_visible = true;
+        self.help_hovered = false;
+        self.close_hovered = false;
+
+        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+        let width = 560;
+        let height = 240;
+        let left = (screen_w - width) / 2;
+        let top = (screen_h - height) / 3;
+
+        SetWindowPos(
+            self.hwnd,
+            HWND_TOPMOST,
+            left,
+            top,
+            width,
+            height,
+            SET_WINDOW_POS_FLAGS(0),
+        )
+        .ok();
+        let _ = ShowWindow(self.hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(self.hwnd);
+        let _ = SetFocus(self.hwnd);
+        let _ = SetTimer(self.hwnd, SPLASH_TIMER_ID, SPLASH_DURATION_MS, None);
+        let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+    }
+
     unsafe fn hide(&mut self) {
         self.visible = false;
+        self.splash_visible = false;
+        let _ = KillTimer(self.hwnd, SPLASH_TIMER_ID);
         self.mode = OverlayMode::WindowsAndTabs;
         self.all_desktops = false;
         self.query.clear();
@@ -319,12 +383,15 @@ impl AppState {
         self.results.clear();
         self.row_layouts.clear();
         self.original_window_rects.clear();
+        self.pending_close_windows.clear();
+        self.scan_apps_after_paint = false;
+        let _ = KillTimer(self.hwnd, CLOSE_REFRESH_TIMER_ID);
         self.unregister_thumbnails();
         let _ = ShowWindow(self.hwnd, SW_HIDE);
     }
 
     unsafe fn toggle(&mut self) {
-        if self.visible {
+        if self.visible && !self.splash_visible {
             self.hide();
         } else {
             self.show();
@@ -335,8 +402,53 @@ impl AppState {
         self.unregister_thumbnails();
         self.windows = enumerate_windows(self.hwnd, self.all_desktops);
         self.accessibility_tabs = scan_chrome_tabs(&self.windows);
-        self.apps = enumerate_apps();
         self.rebuild_results();
+    }
+
+    unsafe fn start_app_scan_if_needed(&mut self) {
+        if self.app_scan_completed || self.app_scan_rx.is_some() {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        self.app_scan_rx = Some(receiver);
+        let _ = SetTimer(self.hwnd, APP_SCAN_TIMER_ID, APP_SCAN_POLL_MS, None);
+        let _ = thread::spawn(move || {
+            let _ = sender.send(enumerate_apps());
+        });
+    }
+
+    unsafe fn poll_app_scan(&mut self) {
+        let Some(scan_result) = self
+            .app_scan_rx
+            .as_ref()
+            .map(|receiver| receiver.try_recv())
+        else {
+            return;
+        };
+
+        match scan_result {
+            Ok(apps) => {
+                self.apps = apps;
+                self.app_scan_completed = true;
+                self.app_scan_rx = None;
+                let _ = KillTimer(self.hwnd, APP_SCAN_TIMER_ID);
+                if self.mode == OverlayMode::Apps {
+                    self.rebuild_results();
+                    let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.app_scan_completed = true;
+                self.app_scan_rx = None;
+                let _ = KillTimer(self.hwnd, APP_SCAN_TIMER_ID);
+                if self.mode == OverlayMode::Apps {
+                    self.rebuild_results();
+                    let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+        }
     }
 
     fn rebuild_results(&mut self) {
@@ -360,7 +472,7 @@ impl AppState {
     }
 
     unsafe fn on_char(&mut self, ch: char) {
-        if !self.visible {
+        if !self.visible || self.splash_visible {
             return;
         }
         if is_control_down() {
@@ -378,8 +490,16 @@ impl AppState {
         if !self.visible {
             return DeferredAction::None;
         }
-
         let ctrl_down = is_control_down();
+        if self.splash_visible {
+            match key {
+                key if key == VK_ESCAPE.0 as u32 => self.hide(),
+                key if key == VK_RETURN.0 as u32 || key == VK_SPACE.0 as u32 => self.show(),
+                _ => {}
+            }
+            return DeferredAction::None;
+        }
+
         match key {
             key if key == VK_ESCAPE.0 as u32 => self.hide(),
             key if key == VK_BACK.0 as u32 => {
@@ -388,6 +508,8 @@ impl AppState {
                 self.rebuild_results();
                 let _ = InvalidateRect(self.hwnd, None, BOOL(1));
             }
+            key if ctrl_down && key == KEY_F => return self.selected_toggle_maximize(),
+            key if ctrl_down && key == KEY_W => return self.selected_close_window(),
             key if ctrl_down && is_app_mode_toggle_key(key) => self.toggle_app_mode(),
             key if ctrl_down
                 && self.mode == OverlayMode::WindowsAndTabs
@@ -427,7 +549,7 @@ impl AppState {
     unsafe fn toggle_app_mode(&mut self) {
         self.mode = match self.mode {
             OverlayMode::WindowsAndTabs => {
-                self.apps = enumerate_apps();
+                self.start_app_scan_if_needed();
                 OverlayMode::Apps
             }
             OverlayMode::Apps => OverlayMode::WindowsAndTabs,
@@ -470,6 +592,7 @@ impl AppState {
             (OverlayMode::WindowsAndTabs, true) => {
                 "No matching windows or Chrome tabs on any desktop"
             }
+            (OverlayMode::Apps, _) if self.app_scan_rx.is_some() => "Scanning installed apps...",
             (OverlayMode::Apps, _) => "No matching installed apps",
         }
     }
@@ -486,6 +609,73 @@ impl AppState {
             overlay_hwnd: self.hwnd,
             restore_overlay_focus,
         }))
+    }
+
+    fn selected_toggle_maximize(&self) -> DeferredAction {
+        let Some(result) = self.results.get(self.selected).cloned() else {
+            return DeferredAction::None;
+        };
+        let Some(hwnd) = selected_move_target_hwnd(&result, &self.windows) else {
+            return DeferredAction::None;
+        };
+
+        DeferredAction::ToggleMaximize(Box::new(ToggleMaximizeRequest {
+            hwnd,
+            overlay_hwnd: self.hwnd,
+        }))
+    }
+
+    unsafe fn selected_close_window(&mut self) -> DeferredAction {
+        let Some(result) = self.results.get(self.selected).cloned() else {
+            return DeferredAction::None;
+        };
+        let Some(hwnd) = selected_move_target_hwnd(&result, &self.windows) else {
+            return DeferredAction::None;
+        };
+
+        self.track_pending_close(hwnd);
+
+        DeferredAction::CloseWindow(Box::new(CloseWindowRequest {
+            hwnd,
+            overlay_hwnd: self.hwnd,
+        }))
+    }
+
+    unsafe fn track_pending_close(&mut self, hwnd: isize) {
+        self.pending_close_windows
+            .insert(hwnd, CLOSE_REFRESH_ATTEMPTS);
+        let _ = SetTimer(
+            self.hwnd,
+            CLOSE_REFRESH_TIMER_ID,
+            CLOSE_REFRESH_POLL_MS,
+            None,
+        );
+    }
+
+    unsafe fn poll_pending_close_windows(&mut self) {
+        let mut closed_window_removed = false;
+        self.pending_close_windows.retain(|hwnd, attempts| {
+            if !IsWindow(hwnd_from_isize(*hwnd)).as_bool() {
+                closed_window_removed = true;
+                return false;
+            }
+
+            if *attempts == 0 {
+                return false;
+            }
+
+            *attempts -= 1;
+            true
+        });
+
+        if self.pending_close_windows.is_empty() {
+            let _ = KillTimer(self.hwnd, CLOSE_REFRESH_TIMER_ID);
+        }
+
+        if closed_window_removed && self.visible && !self.splash_visible {
+            self.refresh();
+            let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+        }
     }
 
     unsafe fn selected_move_to_next_monitor(&mut self) -> DeferredAction {
@@ -527,14 +717,103 @@ impl AppState {
         let _ = GetClientRect(self.hwnd, &mut rect);
 
         fill_rect(hdc, rect, rgb(24, 26, 27));
-        self.draw_search(hdc, rect);
-        self.draw_results(hdc, rect);
-        if self.help_hovered {
-            self.draw_help_tooltip(hdc, rect);
+        if self.splash_visible {
+            self.draw_splash(hdc, rect);
+        } else {
+            self.draw_search(hdc, rect);
+            self.draw_results(hdc, rect);
+            if self.help_hovered {
+                self.draw_help_tooltip(hdc, rect);
+            }
+            self.update_thumbnails();
+            if self.scan_apps_after_paint {
+                self.scan_apps_after_paint = false;
+                self.start_app_scan_if_needed();
+            }
         }
-        self.update_thumbnails();
 
         let _ = EndPaint(self.hwnd, &ps);
+    }
+
+    unsafe fn draw_splash(&self, hdc: HDC, rect: RECT) {
+        let icon_size = 48;
+        let icon_left = rect.left + 34;
+        let icon_top = rect.top + 34;
+        let _ = DrawIconEx(
+            hdc,
+            icon_left,
+            icon_top,
+            self.app_icon,
+            icon_size,
+            icon_size,
+            0,
+            HBRUSH(null_mut()),
+            DI_NORMAL,
+        );
+
+        let title_font = make_font(28, FW_BOLD.0 as i32);
+        let old_title = SelectObject(hdc, title_font);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, rgb(247, 250, 252));
+        draw_text(
+            hdc,
+            "Mega Win Alt Tab",
+            RECT {
+                left: icon_left + icon_size + 18,
+                top: rect.top + 30,
+                right: rect.right - 28,
+                bottom: rect.top + 66,
+            },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        SelectObject(hdc, old_title);
+        let _ = DeleteObject(title_font);
+
+        let subtitle_font = make_font(17, FW_NORMAL.0 as i32);
+        let old_subtitle = SelectObject(hdc, subtitle_font);
+        SetTextColor(hdc, rgb(190, 198, 206));
+        draw_text(
+            hdc,
+            "Search windows, Chrome tabs, and installed apps.",
+            RECT {
+                left: icon_left + icon_size + 18,
+                top: rect.top + 70,
+                right: rect.right - 28,
+                bottom: rect.top + 98,
+            },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        SelectObject(hdc, old_subtitle);
+        let _ = DeleteObject(subtitle_font);
+
+        let hint_font = make_font(16, FW_NORMAL.0 as i32);
+        let old_hint = SelectObject(hdc, hint_font);
+        SetTextColor(hdc, rgb(232, 236, 241));
+        draw_text(
+            hdc,
+            "Ctrl+Alt+Space opens the switcher",
+            RECT {
+                left: rect.left + 34,
+                top: rect.top + 126,
+                right: rect.right - 34,
+                bottom: rect.top + 154,
+            },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        SetTextColor(hdc, rgb(160, 170, 181));
+        draw_text(
+            hdc,
+            "The tray icon stays running in the notification area.",
+            RECT {
+                left: rect.left + 34,
+                top: rect.top + 158,
+                right: rect.right - 34,
+                bottom: rect.top + 186,
+            },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        SelectObject(hdc, old_hint);
+        let _ = DeleteObject(hint_font);
     }
 
     unsafe fn draw_search(&mut self, hdc: HDC, rect: RECT) {
@@ -965,7 +1244,9 @@ impl Drop for AppState {
 enum DeferredAction {
     None,
     Activate(Box<ActivationRequest>),
+    CloseWindow(Box<CloseWindowRequest>),
     MoveToNextMonitor(Box<MoveWindowRequest>),
+    ToggleMaximize(Box<ToggleMaximizeRequest>),
 }
 
 struct ActivationRequest {
@@ -982,6 +1263,16 @@ struct MoveWindowRequest {
     original_rect: RECT,
 }
 
+struct CloseWindowRequest {
+    hwnd: isize,
+    overlay_hwnd: HWND,
+}
+
+struct ToggleMaximizeRequest {
+    hwnd: isize,
+    overlay_hwnd: HWND,
+}
+
 impl DeferredAction {
     unsafe fn run(self) -> bool {
         match self {
@@ -990,7 +1281,18 @@ impl DeferredAction {
                 run_activation(*request);
                 false
             }
-            Self::MoveToNextMonitor(request) => run_move_to_next_monitor(*request),
+            Self::CloseWindow(request) => {
+                let _ = run_close_window(*request);
+                false
+            }
+            Self::MoveToNextMonitor(request) => {
+                let _ = run_move_to_next_monitor(*request);
+                false
+            }
+            Self::ToggleMaximize(request) => {
+                run_toggle_maximize(*request);
+                false
+            }
         }
     }
 }
@@ -1096,6 +1398,28 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
         WM_PAINT => {
             with_state_mut(state_ptr, "paint overlay", (), |state| state.paint());
             return LRESULT(0);
+        }
+        WM_TIMER => {
+            if wparam.0 == SPLASH_TIMER_ID {
+                with_state_mut(state_ptr, "hide splash", (), |state| {
+                    if state.splash_visible {
+                        state.hide();
+                    }
+                });
+                return LRESULT(0);
+            }
+            if wparam.0 == CLOSE_REFRESH_TIMER_ID {
+                with_state_mut(state_ptr, "poll pending close windows", (), |state| {
+                    state.poll_pending_close_windows()
+                });
+                return LRESULT(0);
+            }
+            if wparam.0 == APP_SCAN_TIMER_ID {
+                with_state_mut(state_ptr, "poll app scan", (), |state| {
+                    state.poll_app_scan()
+                });
+                return LRESULT(0);
+            }
         }
         WM_DESTROY => {
             let state = Rc::from_raw(state_ptr);
@@ -1586,6 +1910,34 @@ unsafe fn run_activation(request: ActivationRequest) {
     }
 }
 
+unsafe fn run_close_window(request: CloseWindowRequest) -> bool {
+    let hwnd = hwnd_from_isize(request.hwnd);
+    if !IsWindow(hwnd).as_bool() {
+        return false;
+    }
+
+    move_window_to_overlay_desktop_if_needed(hwnd, request.overlay_hwnd);
+    let close_sent = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok();
+    restore_overlay_focus(request.overlay_hwnd);
+    close_sent
+}
+
+unsafe fn run_toggle_maximize(request: ToggleMaximizeRequest) {
+    let hwnd = hwnd_from_isize(request.hwnd);
+    if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+
+    move_window_to_overlay_desktop_if_needed(hwnd, request.overlay_hwnd);
+    let show_command = if IsZoomed(hwnd).as_bool() {
+        SW_RESTORE
+    } else {
+        SW_MAXIMIZE
+    };
+    let _ = ShowWindow(hwnd, show_command);
+    restore_overlay_focus(request.overlay_hwnd);
+}
+
 unsafe fn run_move_to_next_monitor(request: MoveWindowRequest) -> bool {
     let hwnd = hwnd_from_isize(request.hwnd);
     if !IsWindow(hwnd).as_bool() {
@@ -1861,6 +2213,15 @@ fn to_win_error(error: anyhow::Error) -> windows::core::Error {
     )
 }
 
+fn has_startup_arg<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    args.into_iter()
+        .any(|arg| arg.as_ref() == OsStr::new("--startup"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2009,6 +2370,13 @@ mod tests {
         assert_eq!(buttons.help.top, buttons.close.top);
         assert_eq!(buttons.help.bottom, buttons.close.bottom);
         assert_eq!(buttons.close.right, search_rect.right - 18);
+    }
+
+    #[test]
+    fn startup_argument_is_detected_exactly() {
+        assert!(has_startup_arg(["mega-win-alt-tab.exe", "--startup"]));
+        assert!(!has_startup_arg(["mega-win-alt-tab.exe"]));
+        assert!(!has_startup_arg(["mega-win-alt-tab.exe", "--startup-now"]));
     }
 
     #[test]

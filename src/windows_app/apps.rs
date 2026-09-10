@@ -1,12 +1,16 @@
 use mega_win_alt_tab::core::{AppEntry, AppSource};
+use serde::Deserialize;
 use std::fs;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HWND};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
     HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, REG_VALUE_TYPE,
 };
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
@@ -21,6 +25,7 @@ pub(super) fn enumerate_apps() -> Vec<AppEntry> {
         collect_apps_from_app_paths(HKEY_CURRENT_USER, AppSource::UserAppPath, &mut apps);
         collect_apps_from_app_paths(HKEY_LOCAL_MACHINE, AppSource::MachineAppPath, &mut apps);
     }
+    collect_packaged_apps(&mut apps);
     apps
 }
 
@@ -94,10 +99,7 @@ unsafe fn collect_apps_from_app_paths(root: HKEY, source: AppSource, apps: &mut 
     }
 
     let mut index = 0;
-    loop {
-        let Some(key_name) = enum_registry_subkey(app_paths, index) else {
-            break;
-        };
+    while let Some(key_name) = enum_registry_subkey(app_paths, index) {
         index += 1;
 
         let key_name_wide = to_wide_z(&key_name);
@@ -218,7 +220,7 @@ fn pretty_app_name(value: &str) -> String {
 }
 
 fn registry_bytes_to_string(bytes: &[u8]) -> Option<String> {
-    if bytes.len() % 2 != 0 {
+    if bytes.len() & 1 == 1 {
         return None;
     }
 
@@ -234,6 +236,73 @@ fn registry_bytes_to_string(bytes: &[u8]) -> Option<String> {
     }
 
     String::from_utf16(&units).ok()
+}
+
+#[derive(Deserialize)]
+struct StartAppEntry {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "AppID")]
+    app_id: String,
+}
+
+fn collect_packaged_apps(apps: &mut Vec<AppEntry>) {
+    for entry in start_app_entries() {
+        let name = entry.name.trim();
+        let app_id = entry.app_id.trim();
+        if name.is_empty() || !is_packaged_app_id(app_id) {
+            continue;
+        }
+
+        apps.push(AppEntry {
+            name: name.to_string(),
+            launch_path: packaged_app_launch_path(app_id),
+            source: AppSource::PackagedApp,
+        });
+    }
+}
+
+fn start_app_entries() -> Vec<StartAppEntry> {
+    let script = r#"
+$apps = @(Get-StartApps | Where-Object { $_.AppID -like '*!*' } | Select-Object Name,AppID)
+ConvertTo-Json -InputObject $apps -Compress
+"#;
+    let Ok(output) = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .output()
+    else {
+        return Vec::new();
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let json = String::from_utf8_lossy(&output.stdout);
+    parse_start_app_entries(json.trim())
+}
+
+fn parse_start_app_entries(json: &str) -> Vec<StartAppEntry> {
+    if json.is_empty() || json == "null" {
+        return Vec::new();
+    }
+
+    serde_json::from_str::<Vec<StartAppEntry>>(json).unwrap_or_default()
+}
+
+fn is_packaged_app_id(app_id: &str) -> bool {
+    app_id.contains('!') && !app_id.starts_with('{')
+}
+
+fn packaged_app_launch_path(app_id: &str) -> String {
+    format!("shell:AppsFolder\\{app_id}")
 }
 
 pub(super) unsafe fn launch_app(hwnd: HWND, launch_path: &str) -> bool {
@@ -320,5 +389,30 @@ mod tests {
             registry_bytes_to_string(&bytes),
             Some(r"C:\Tools\thunderbird.exe".to_string())
         );
+    }
+
+    #[test]
+    fn packaged_app_ids_launch_through_apps_folder() {
+        let app_id = "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App";
+
+        assert!(is_packaged_app_id(app_id));
+        assert_eq!(
+            packaged_app_launch_path(app_id),
+            r"shell:AppsFolder\5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"
+        );
+        assert!(!is_packaged_app_id(
+            r"{6D809377-6AF0-444B-8957-A3773F02200E}\IrfanView\i_changes.txt"
+        ));
+    }
+
+    #[test]
+    fn start_app_entries_parse_json_array() {
+        let apps = parse_start_app_entries(
+            r#"[{"Name":"WhatsApp","AppID":"5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"}]"#,
+        );
+
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "WhatsApp");
+        assert_eq!(apps[0].app_id, "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App");
     }
 }

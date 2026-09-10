@@ -47,6 +47,7 @@ pub enum AppSource {
     UserAppPath,
     AllUsersStartMenu,
     MachineAppPath,
+    PackagedApp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -390,6 +391,7 @@ fn app_source_priority(source: AppSource) -> i32 {
         AppSource::UserAppPath => 1,
         AppSource::AllUsersStartMenu => 2,
         AppSource::MachineAppPath => 3,
+        AppSource::PackagedApp => 4,
     }
 }
 

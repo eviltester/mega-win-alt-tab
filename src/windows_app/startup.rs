@@ -117,7 +117,7 @@ unsafe fn delete_run_value() -> bool {
 }
 
 fn registry_bytes_to_string(bytes: &[u8]) -> Option<String> {
-    if bytes.len() % 2 != 0 {
+    if bytes.len() & 1 == 1 {
         return None;
     }
 
