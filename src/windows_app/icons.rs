@@ -109,7 +109,14 @@ mod tests {
     use super::*;
 
     fn contains_bgra(bits: &[u8], color: [u8; 4]) -> bool {
-        bits.chunks_exact(4).any(|pixel| pixel == color)
+        let mut index = 0;
+        while index + 4 <= bits.len() {
+            if bits[index..index + 4] == color {
+                return true;
+            }
+            index += 4;
+        }
+        false
     }
 
     #[test]
