@@ -8,36 +8,52 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, PostMessageW, SetForegroundWindow,
-    TrackPopupMenu, HICON, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
+    TrackPopupMenu, HICON, MENU_ITEM_FLAGS, MF_CHECKED, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
 };
 
 pub(super) const TRAY_ICON_ID: u32 = 1;
 pub(super) const WM_TRAYICON: u32 = WM_APP + 1;
+const TRAY_STARTUP_COMMAND_ID: usize = 1000;
 const TRAY_EXIT_COMMAND_ID: usize = 1001;
 static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 
-pub(super) unsafe fn show_context_menu(hwnd: HWND) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TrayMenuCommand {
+    None,
+    ToggleStartup,
+    Exit,
+}
+
+pub(super) unsafe fn show_context_menu(hwnd: HWND, run_at_startup: bool) -> TrayMenuCommand {
     if MENU_OPEN
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        return false;
+        return TrayMenuCommand::None;
     }
 
-    let exit_requested = show_context_menu_inner(hwnd);
+    let command = show_context_menu_inner(hwnd, run_at_startup);
     MENU_OPEN.store(false, Ordering::Release);
-    exit_requested
+    command
 }
 
-unsafe fn show_context_menu_inner(hwnd: HWND) -> bool {
+unsafe fn show_context_menu_inner(hwnd: HWND, run_at_startup: bool) -> TrayMenuCommand {
     let Ok(menu) = CreatePopupMenu() else {
-        return false;
+        return TrayMenuCommand::None;
     };
+    let startup_flags = checked_menu_flags(run_at_startup);
+    let _ = AppendMenuW(
+        menu,
+        startup_flags,
+        TRAY_STARTUP_COMMAND_ID,
+        w!("Run at startup"),
+    );
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
     let _ = AppendMenuW(menu, MF_STRING, TRAY_EXIT_COMMAND_ID, w!("Exit"));
 
     let mut point = POINT::default();
-    let mut exit_requested = false;
+    let mut selected = TrayMenuCommand::None;
     if GetCursorPos(&mut point).is_ok() {
         let _ = SetForegroundWindow(hwnd);
         let command = TrackPopupMenu(
@@ -49,12 +65,28 @@ unsafe fn show_context_menu_inner(hwnd: HWND) -> bool {
             hwnd,
             None,
         );
-        exit_requested = command.0 as usize == TRAY_EXIT_COMMAND_ID;
+        selected = menu_command_from_id(command.0 as usize);
         let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
     }
 
     let _ = DestroyMenu(menu);
-    exit_requested
+    selected
+}
+
+fn checked_menu_flags(checked: bool) -> MENU_ITEM_FLAGS {
+    if checked {
+        MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
+    } else {
+        MF_STRING
+    }
+}
+
+fn menu_command_from_id(command_id: usize) -> TrayMenuCommand {
+    match command_id {
+        TRAY_STARTUP_COMMAND_ID => TrayMenuCommand::ToggleStartup,
+        TRAY_EXIT_COMMAND_ID => TrayMenuCommand::Exit,
+        _ => TrayMenuCommand::None,
+    }
 }
 
 pub(super) fn is_tray_icon_message(wparam: WPARAM, lparam: LPARAM) -> bool {
@@ -154,5 +186,27 @@ mod tests {
             NIN_SELECT,
             TRAY_ICON_ID
         )));
+    }
+
+    #[test]
+    fn menu_command_ids_map_to_actions() {
+        assert_eq!(
+            menu_command_from_id(TRAY_STARTUP_COMMAND_ID),
+            TrayMenuCommand::ToggleStartup
+        );
+        assert_eq!(
+            menu_command_from_id(TRAY_EXIT_COMMAND_ID),
+            TrayMenuCommand::Exit
+        );
+        assert_eq!(menu_command_from_id(0), TrayMenuCommand::None);
+    }
+
+    #[test]
+    fn startup_menu_item_can_be_checked() {
+        assert_eq!(checked_menu_flags(false), MF_STRING);
+        assert_eq!(
+            checked_menu_flags(true),
+            MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
+        );
     }
 }

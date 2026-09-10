@@ -7,13 +7,18 @@ mod apps;
 mod icons;
 mod input;
 mod monitors;
+mod startup;
 mod tray;
 mod virtual_desktops;
 
 use apps::{enumerate_apps, launch_app};
 use icons::create_mega_icon;
 use input::{mouse_point, point_in_rect};
-use monitors::{enumerate_monitor_numbers, move_window_to_next_monitor, window_screen_number};
+use monitors::{
+    current_window_rect, enumerate_monitor_numbers, move_window_to_next_monitor,
+    window_screen_number,
+};
+use startup::{is_run_at_startup_enabled, set_run_at_startup};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -29,7 +34,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
 use tray::{
     install_tray_icon, is_tray_context_event, is_tray_icon_message, is_tray_select_event,
-    remove_tray_icon, show_context_menu, WM_TRAYICON,
+    remove_tray_icon, show_context_menu, TrayMenuCommand, WM_TRAYICON,
 };
 use virtual_desktops::{
     move_window_to_overlay_desktop_if_needed, should_include_window_for_desktop,
@@ -208,6 +213,7 @@ struct AppState {
     accessibility_tabs: Vec<TabEntry>,
     results: Vec<SearchResult>,
     thumbnails: HashMap<isize, isize>,
+    original_window_rects: HashMap<isize, RECT>,
     row_layouts: Vec<RowLayout>,
     bridge: ExtensionBridge,
     tray_icon_installed: bool,
@@ -253,6 +259,7 @@ impl AppState {
             accessibility_tabs: Vec::new(),
             results: Vec::new(),
             thumbnails: HashMap::new(),
+            original_window_rects: HashMap::new(),
             row_layouts: Vec::new(),
             bridge,
             tray_icon_installed: false,
@@ -311,6 +318,7 @@ impl AppState {
         self.mouse_tracking = false;
         self.results.clear();
         self.row_layouts.clear();
+        self.original_window_rects.clear();
         self.unregister_thumbnails();
         let _ = ShowWindow(self.hwnd, SW_HIDE);
     }
@@ -480,17 +488,28 @@ impl AppState {
         }))
     }
 
-    fn selected_move_to_next_monitor(&self) -> DeferredAction {
+    unsafe fn selected_move_to_next_monitor(&mut self) -> DeferredAction {
         let Some(result) = self.results.get(self.selected).cloned() else {
             return DeferredAction::None;
         };
         let Some(hwnd) = selected_move_target_hwnd(&result, &self.windows) else {
             return DeferredAction::None;
         };
+        let original_rect = match self.original_window_rects.get(&hwnd).copied() {
+            Some(rect) => rect,
+            None => {
+                let Some(rect) = current_window_rect(hwnd_from_isize(hwnd)) else {
+                    return DeferredAction::None;
+                };
+                self.original_window_rects.insert(hwnd, rect);
+                rect
+            }
+        };
 
         DeferredAction::MoveToNextMonitor(Box::new(MoveWindowRequest {
             hwnd,
             overlay_hwnd: self.hwnd,
+            original_rect,
         }))
     }
 
@@ -960,6 +979,7 @@ struct ActivationRequest {
 struct MoveWindowRequest {
     hwnd: isize,
     overlay_hwnd: HWND,
+    original_rect: RECT,
 }
 
 impl DeferredAction {
@@ -1021,8 +1041,8 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
                     with_state_mut(state_ptr, "show overlay from tray icon", (), |state| {
                         state.show()
                     });
-                } else if is_tray_context_event(lparam) && show_context_menu(hwnd) {
-                    let _ = DestroyWindow(hwnd);
+                } else if is_tray_context_event(lparam) {
+                    handle_tray_menu_command(hwnd);
                 }
             }
             return LRESULT(0);
@@ -1062,9 +1082,7 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
             return LRESULT(0);
         }
         WM_RBUTTONUP | WM_CONTEXTMENU => {
-            if show_context_menu(hwnd) {
-                let _ = DestroyWindow(hwnd);
-            }
+            handle_tray_menu_command(hwnd);
             return LRESULT(0);
         }
         WM_CHAR => {
@@ -1093,6 +1111,21 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
     }
 
     DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
+unsafe fn handle_tray_menu_command(hwnd: HWND) {
+    match show_context_menu(hwnd, is_run_at_startup_enabled()) {
+        TrayMenuCommand::None => {}
+        TrayMenuCommand::ToggleStartup => {
+            let enabled = is_run_at_startup_enabled();
+            if !set_run_at_startup(!enabled) {
+                log_runtime_issue("Failed to update the Windows startup registry value.");
+            }
+        }
+        TrayMenuCommand::Exit => {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
 }
 
 unsafe fn with_state_mut<T>(
@@ -1561,7 +1594,7 @@ unsafe fn run_move_to_next_monitor(request: MoveWindowRequest) -> bool {
 
     move_window_to_overlay_desktop_if_needed(hwnd, request.overlay_hwnd);
 
-    let moved = move_window_to_next_monitor(hwnd);
+    let moved = move_window_to_next_monitor(hwnd, request.original_rect);
     if moved {
         restore_overlay_focus(request.overlay_hwnd);
     }

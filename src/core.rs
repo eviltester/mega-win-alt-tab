@@ -44,7 +44,9 @@ pub struct TabEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppSource {
     UserStartMenu,
+    UserAppPath,
     AllUsersStartMenu,
+    MachineAppPath,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -385,7 +387,9 @@ fn should_replace_app(existing: &AppEntry, candidate: &AppEntry) -> bool {
 fn app_source_priority(source: AppSource) -> i32 {
     match source {
         AppSource::UserStartMenu => 0,
-        AppSource::AllUsersStartMenu => 1,
+        AppSource::UserAppPath => 1,
+        AppSource::AllUsersStartMenu => 2,
+        AppSource::MachineAppPath => 3,
     }
 }
 
@@ -635,6 +639,20 @@ mod tests {
 
         let non_contiguous = build_app_results("sgn", &apps);
         assert!(non_contiguous.is_empty());
+    }
+
+    #[test]
+    fn app_results_match_substrings_inside_app_names() {
+        let apps = vec![app(
+            "Thunderbird",
+            "C:\\Program Files\\Mozilla Thunderbird\\thunderbird.exe",
+            AppSource::UserAppPath,
+        )];
+
+        let results = build_app_results("thunder", &apps);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Thunderbird");
     }
 
     #[test]

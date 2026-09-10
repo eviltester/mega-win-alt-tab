@@ -6,7 +6,7 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +100,14 @@ pub(super) unsafe fn window_screen_number(
     monitor_numbers.get(&(monitor.0 as isize)).copied()
 }
 
-pub(super) unsafe fn move_window_to_next_monitor(hwnd: HWND) -> bool {
+pub(super) unsafe fn current_window_rect(hwnd: HWND) -> Option<RECT> {
+    let mut window_rect = RECT::default();
+    GetWindowRect(hwnd, &mut window_rect)
+        .is_ok()
+        .then_some(window_rect)
+}
+
+pub(super) unsafe fn move_window_to_next_monitor(hwnd: HWND, original_window_rect: RECT) -> bool {
     let monitors = enumerate_monitor_entries();
     if monitors.len() < 2 {
         return false;
@@ -120,43 +127,56 @@ pub(super) unsafe fn move_window_to_next_monitor(hwnd: HWND) -> bool {
     let current = monitors[current_index];
     let next = monitors[(current_index + 1) % monitors.len()];
 
-    let mut window_rect = RECT::default();
-    if GetWindowRect(hwnd, &mut window_rect).is_err() {
+    let Some(window_rect) = current_window_rect(hwnd) else {
         return false;
-    }
+    };
 
-    let (left, top) = next_monitor_window_position(window_rect, current.rect, next.rect);
+    let placement =
+        next_monitor_window_placement(window_rect, original_window_rect, current.rect, next.rect);
     SetWindowPos(
         hwnd,
         None,
-        left,
-        top,
-        0,
-        0,
-        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        placement.left,
+        placement.top,
+        placement.width,
+        placement.height,
+        SWP_NOZORDER | SWP_NOACTIVATE,
     )
     .is_ok()
 }
 
-fn next_monitor_window_position(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowPlacement {
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+}
+
+fn next_monitor_window_placement(
     window_rect: RECT,
+    original_window_rect: RECT,
     current_monitor_rect: RECT,
     next_monitor_rect: RECT,
-) -> (i32, i32) {
-    let width = (window_rect.right - window_rect.left).max(1);
-    let height = (window_rect.bottom - window_rect.top).max(1);
+) -> WindowPlacement {
+    let original_width = (original_window_rect.right - original_window_rect.left).max(1);
+    let original_height = (original_window_rect.bottom - original_window_rect.top).max(1);
     let next_width = (next_monitor_rect.right - next_monitor_rect.left).max(1);
     let next_height = (next_monitor_rect.bottom - next_monitor_rect.top).max(1);
+    let width = original_width.min(next_width);
+    let height = original_height.min(next_height);
 
     let offset_x = window_rect.left - current_monitor_rect.left;
     let offset_y = window_rect.top - current_monitor_rect.top;
     let max_x = (next_width - width).max(0);
     let max_y = (next_height - height).max(0);
 
-    (
-        next_monitor_rect.left + offset_x.clamp(0, max_x),
-        next_monitor_rect.top + offset_y.clamp(0, max_y),
-    )
+    WindowPlacement {
+        left: next_monitor_rect.left + offset_x.clamp(0, max_x),
+        top: next_monitor_rect.top + offset_y.clamp(0, max_y),
+        width,
+        height,
+    }
 }
 
 fn utf16z_to_string(value: &[u16]) -> String {
@@ -181,7 +201,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn next_monitor_position_preserves_offset_and_clamps_to_visible_area() {
+    fn next_monitor_placement_preserves_offset_and_clamps_to_visible_area() {
         let current = RECT {
             left: 0,
             top: 0,
@@ -202,8 +222,83 @@ mod tests {
         };
 
         assert_eq!(
-            next_monitor_window_position(window, current, next),
-            (2020, 320)
+            next_monitor_window_placement(window, window, current, next),
+            WindowPlacement {
+                left: 2020,
+                top: 320,
+                width: 800,
+                height: 400,
+            }
+        );
+    }
+
+    #[test]
+    fn next_monitor_placement_resizes_to_fit_smaller_screen() {
+        let current = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        let next = RECT {
+            left: 2560,
+            top: 0,
+            right: 3840,
+            bottom: 720,
+        };
+        let original = RECT {
+            left: 100,
+            top: 100,
+            right: 2100,
+            bottom: 1300,
+        };
+
+        assert_eq!(
+            next_monitor_window_placement(original, original, current, next),
+            WindowPlacement {
+                left: 2560,
+                top: 0,
+                width: 1280,
+                height: 720,
+            }
+        );
+    }
+
+    #[test]
+    fn next_monitor_placement_restores_original_size_on_larger_screen() {
+        let current = RECT {
+            left: 0,
+            top: 0,
+            right: 1280,
+            bottom: 720,
+        };
+        let next = RECT {
+            left: 1280,
+            top: 0,
+            right: 3840,
+            bottom: 1440,
+        };
+        let original = RECT {
+            left: 100,
+            top: 100,
+            right: 2100,
+            bottom: 1300,
+        };
+        let current_resized = RECT {
+            left: 0,
+            top: 0,
+            right: 1280,
+            bottom: 720,
+        };
+
+        assert_eq!(
+            next_monitor_window_placement(current_resized, original, current, next),
+            WindowPlacement {
+                left: 1280,
+                top: 0,
+                width: 2000,
+                height: 1200,
+            }
         );
     }
 

@@ -18,8 +18,9 @@ from all virtual desktops, Ctrl+? to toggle matching installed apps, Enter to
 activate or launch the selected result and close the switcher, and Esc to close.
 
 When the app is running, it also adds a notification-area icon. Right-click that
-icon and choose `Exit` to quit the application. Click the icon to open the
-switcher.
+icon to toggle `Run at startup` or choose `Exit` to quit the application. The
+startup option writes a per-user Windows startup entry that launches the app
+with `--startup`. Click the icon to open the switcher.
 
 ## Quality Checks
 
