@@ -1,0 +1,32 @@
+# Rust build output
+/target/
+
+# Rust tool scratch files
+**/*.rs.bk
+
+# Local environment/config
+.env
+.env.*
+!.env.example
+
+# Logs and crash dumps
+*.log
+*.dmp
+*.mdmp
+
+# Windows packaged build outputs
+/dist/
+/release/
+*.msi
+*.msix
+*.appx
+
+# Local editor metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Chrome extension private/package artifacts
+extension/chrome/*.pem
+extension/chrome/*.crx

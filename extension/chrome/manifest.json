@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Mega Win Alt Tab Bridge",
+  "description": "Shares Chrome tab titles with the Mega Win Alt Tab desktop app.",
+  "version": "0.1.0",
+  "permissions": ["tabs", "alarms"],
+  "host_permissions": ["http://127.0.0.1:39276/*"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

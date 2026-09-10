@@ -1,0 +1,158 @@
+name: Release Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, for example 0.2.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        required: true
+        default: false
+        type: boolean
+      draft:
+        description: "Create the GitHub release as a draft"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish Windows release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Configure Rust
+        shell: pwsh
+        run: |
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Validate version
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.version }}".Trim()
+          if ($version.StartsWith("v")) {
+            $version = $version.Substring(1)
+          }
+
+          if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
+            throw "Version '$version' is not valid SemVer. Use a value like 0.2.0 or 0.2.0-beta.1."
+          }
+
+          $tag = "v$version"
+          git fetch --tags --force
+
+          if (git rev-parse -q --verify "refs/tags/$tag") {
+            throw "Tag '$tag' already exists."
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Update Cargo version
+        shell: pwsh
+        run: |
+          .\scripts\set-version.ps1 -Version "${{ steps.version.outputs.version }}"
+          cargo check
+
+      - name: Run checks
+        shell: pwsh
+        run: .\scripts\check.ps1
+
+      - name: Build release executable
+        shell: pwsh
+        run: cargo build --release
+
+      - name: Package release assets
+        id: package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $dist = Join-Path $PWD "dist"
+          $staging = Join-Path $dist "mega-win-alt-tab-v$version-windows-x64"
+          $exeAsset = Join-Path $dist "mega-win-alt-tab-v$version-windows-x64.exe"
+          $zipAsset = Join-Path $dist "mega-win-alt-tab-v$version-windows-x64.zip"
+
+          Remove-Item -Recurse -Force $dist -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+
+          Copy-Item -Path "target\release\mega-win-alt-tab.exe" -Destination $exeAsset -Force
+          Copy-Item -Path "target\release\mega-win-alt-tab.exe" -Destination (Join-Path $staging "mega-win-alt-tab.exe") -Force
+          Copy-Item -Path "README.md" -Destination $staging -Force
+
+          New-Item -ItemType Directory -Force -Path (Join-Path $staging "extension") | Out-Null
+          Copy-Item -Path "extension\chrome" -Destination (Join-Path $staging "extension\chrome") -Recurse -Force
+
+          Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $zipAsset -Force
+
+          "exe_asset=$exeAsset" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "zip_asset=$zipAsset" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Commit version and tag
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          git status --short
+
+          if (-not (git diff --quiet -- Cargo.toml Cargo.lock)) {
+            git add Cargo.toml Cargo.lock
+            git commit -m "Release $tag"
+          } else {
+            Write-Host "Cargo.toml and Cargo.lock already contain version ${{ steps.version.outputs.version }}."
+          }
+
+          git tag -a $tag -m "Mega Win Alt Tab $tag"
+          git push origin "HEAD:$env:GITHUB_REF_NAME"
+          git push origin $tag
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $version = "${{ steps.version.outputs.version }}"
+          $notes = Join-Path $PWD "release-notes.md"
+          $flags = @()
+
+          if ("${{ inputs.prerelease }}" -eq "true") {
+            $flags += "--prerelease"
+          }
+
+          if ("${{ inputs.draft }}" -eq "true") {
+            $flags += "--draft"
+          }
+
+          @"
+          Mega Win Alt Tab $tag
+
+          Assets:
+          - mega-win-alt-tab-v$version-windows-x64.exe: standalone Windows executable
+          - mega-win-alt-tab-v$version-windows-x64.zip: executable, README, and companion Chrome extension
+          "@ | Set-Content -Path $notes -Encoding UTF8
+
+          gh release create $tag `
+            "${{ steps.package.outputs.exe_asset }}" `
+            "${{ steps.package.outputs.zip_asset }}" `
+            --verify-tag `
+            --title "Mega Win Alt Tab $tag" `
+            --notes-file $notes `
+            @flags
