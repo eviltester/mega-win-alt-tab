@@ -18,6 +18,21 @@ startup option writes a per-user Windows startup entry that launches the app
 with `--startup`. Normal launches show a short splash screen; `--startup`
 launches quietly to the tray. Click the icon to open the switcher.
 
+The startup entry stores the exact executable path and file name that was
+running when you enabled `Run at startup`. If you download a new version with a
+different `.exe` name or location, run that new executable and toggle
+`Run at startup` again so Windows starts the new copy.
+
+When enabling `Run at startup`, the app also checks for possible older startup
+entries created from early numbered release executable names, such as
+`mega-win-alt-tab-vX.Y.Z-windows-x64.exe`. If it finds any, it shows the entry
+names and paths and asks whether to remove them. Choosing `No` leaves them alone
+and still sets the current copy to run at startup.
+
+When the overlay is shown, the app checks GitHub Releases in the background. If
+a newer release exists, the overlay shows an update notice that opens the
+GitHub Releases page when clicked. It does not auto-download or install updates.
+
 ## Keys
 
 | Key | What it does |
@@ -30,12 +45,13 @@ launches quietly to the tray. Click the icon to open the switcher.
 | `Tab` | Move selection down. |
 | `Enter` | Activate the selected window/tab, or launch the selected app in app mode, then close the overlay. |
 | `Esc` | Close the overlay without quitting the app. |
-| `Right` | Bring the selected window/tab to the foreground while keeping the overlay open. |
-| `Left` | Move the selected window/tab parent, or matching running app window, to the next screen. |
+| `Left` | Show the selected window/tab without moving keyboard focus away from the overlay; tap again to briefly highlight it. |
+| `Right` | Show the selected window/tab without moving keyboard focus away from the overlay; tap again to briefly highlight it. |
 | `Ctrl+F` | Maximize the selected window, or restore it if it is already maximized. |
+| `Ctrl+S` | Minimize the selected window. |
 | `Ctrl+W` | Close the selected window with the app's normal close behavior. |
-| `Ctrl+Right` | Increase thumbnail size. |
-| `Ctrl+Left` | Decrease thumbnail size. |
+| `Ctrl+Left` | Move the selected window/tab parent, or matching running app window, to the previous screen in the Windows layout order. |
+| `Ctrl+Right` | Move the selected window/tab parent, or matching running app window, to the next screen in the Windows layout order. |
 | `Ctrl+D` | Toggle all-desktops mode for windows and tabs. |
 | `Ctrl+?` / `Ctrl+/` | Toggle app launcher mode while preserving the current search text. |
 
@@ -90,8 +106,8 @@ the tab result is shown and the duplicate browser-window result is hidden.
 While the overlay is open, press `Ctrl+?` (or `Ctrl+/`) to switch the current
 search into app launcher mode. The app scans current-user and all-users Start
 Menu shortcuts, Windows App Paths, and packaged Windows apps from the Start app
-catalog. It collapses duplicate app names and launches the selected app with
-Enter.
+catalog. It collapses duplicate app names and duplicate launch targets, then
+launches the selected app with Enter.
 
 ## All Desktops Mode
 

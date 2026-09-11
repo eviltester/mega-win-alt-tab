@@ -54,6 +54,7 @@ pub enum AppSource {
 pub struct AppEntry {
     pub name: String,
     pub launch_path: String,
+    pub launch_identity: Option<String>,
     pub source: AppSource,
 }
 
@@ -354,28 +355,68 @@ pub fn build_app_results(query: &str, apps: &[AppEntry]) -> Vec<SearchResult> {
 }
 
 pub fn dedupe_apps(apps: &[AppEntry]) -> Vec<AppEntry> {
-    let mut apps_by_name: HashMap<String, AppEntry> = HashMap::new();
+    let mut deduped = Vec::<AppEntry>::new();
     for app in apps {
-        let key = normalize_for_match(&app.name);
-        if key.is_empty() || app.launch_path.trim().is_empty() {
+        if normalize_for_match(&app.name).is_empty() || app.launch_path.trim().is_empty() {
             continue;
         }
 
-        match apps_by_name.get(&key) {
-            Some(existing) if !should_replace_app(existing, app) => {}
-            _ => {
-                apps_by_name.insert(key, app.clone());
+        if let Some(existing) = deduped
+            .iter_mut()
+            .find(|existing| apps_are_duplicates(existing, app))
+        {
+            if should_replace_app(existing, app) {
+                *existing = app.clone();
             }
+            continue;
         }
+
+        deduped.push(app.clone());
     }
 
-    let mut apps = apps_by_name.into_values().collect::<Vec<_>>();
-    apps.sort_by(|a, b| {
+    deduped.sort_by(|a, b| {
         normalize_for_match(&a.name)
             .cmp(&normalize_for_match(&b.name))
             .then_with(|| a.launch_path.cmp(&b.launch_path))
     });
-    apps
+    deduped
+}
+
+fn apps_are_duplicates(left: &AppEntry, right: &AppEntry) -> bool {
+    let left_name = normalize_for_match(&left.name);
+    if left_name == normalize_for_match(&right.name) {
+        return true;
+    }
+
+    let Some(left_identity) = app_launch_identity_key(left) else {
+        return false;
+    };
+    let Some(right_identity) = app_launch_identity_key(right) else {
+        return false;
+    };
+
+    left_identity == right_identity
+}
+
+fn app_launch_identity_key(app: &AppEntry) -> Option<String> {
+    let identity = app
+        .launch_identity
+        .as_deref()
+        .unwrap_or(&app.launch_path)
+        .trim();
+    if identity.is_empty() {
+        return None;
+    }
+
+    Some(normalize_launch_identity(identity))
+}
+
+fn normalize_launch_identity(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .to_ascii_lowercase()
 }
 
 fn should_replace_app(existing: &AppEntry, candidate: &AppEntry) -> bool {
@@ -553,6 +594,21 @@ mod tests {
         AppEntry {
             name: name.to_string(),
             launch_path: launch_path.to_string(),
+            launch_identity: None,
+            source,
+        }
+    }
+
+    fn app_with_identity(
+        name: &str,
+        launch_path: &str,
+        launch_identity: &str,
+        source: AppSource,
+    ) -> AppEntry {
+        AppEntry {
+            name: name.to_string(),
+            launch_path: launch_path.to_string(),
+            launch_identity: Some(launch_identity.to_string()),
             source,
         }
     }
@@ -676,6 +732,30 @@ mod tests {
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].source, AppSource::UserStartMenu);
         assert!(deduped[0].launch_path.contains("Roaming"));
+    }
+
+    #[test]
+    fn app_dedupe_collapses_different_names_with_same_launch_identity() {
+        let apps = vec![
+            app_with_identity(
+                "Google Chrome",
+                "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Google Chrome.lnk",
+                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                AppSource::AllUsersStartMenu,
+            ),
+            app_with_identity(
+                "Chrome",
+                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                "c:/program files/google/chrome/application/chrome.exe",
+                AppSource::MachineAppPath,
+            ),
+        ];
+
+        let deduped = dedupe_apps(&apps);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].name, "Google Chrome");
+        assert_eq!(deduped[0].source, AppSource::AllUsersStartMenu);
     }
 
     #[test]

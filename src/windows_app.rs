@@ -9,16 +9,20 @@ mod input;
 mod monitors;
 mod startup;
 mod tray;
+mod updates;
 mod virtual_desktops;
 
 use apps::{enumerate_apps, launch_app};
 use icons::create_mega_icon;
 use input::{mouse_point, point_in_rect};
 use monitors::{
-    current_window_rect, enumerate_monitor_numbers, move_window_to_next_monitor,
-    window_screen_number,
+    current_window_rect, enumerate_monitor_numbers, monitor_rect_for_window,
+    move_window_to_monitor, window_screen_number, MonitorMoveDirection,
 };
-use startup::{is_run_at_startup_enabled, set_run_at_startup};
+use startup::{
+    is_run_at_startup_enabled, legacy_startup_entries, remove_startup_entries, set_run_at_startup,
+    LegacyStartupEntry,
+};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -35,8 +39,9 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime};
 use tray::{
     install_tray_icon, is_tray_context_event, is_tray_icon_message, is_tray_select_event,
-    remove_tray_icon, show_context_menu, TrayMenuCommand, WM_TRAYICON,
+    remove_tray_icon, show_context_menu, show_update_notification, TrayMenuCommand, WM_TRAYICON,
 };
+use updates::{check_for_update, UpdateInfo};
 use virtual_desktops::{
     move_window_to_overlay_desktop_if_needed, should_include_window_for_desktop,
     virtual_desktop_manager, window_desktop_location,
@@ -47,8 +52,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmRegisterThumbnail, DwmUnregisterThumbnail,
-    DwmUpdateThumbnailProperties, DWMWA_CLOAKED, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY,
-    DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
+    DwmUpdateThumbnailProperties, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse,
@@ -74,43 +79,55 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_NOREPEAT, TME_LEAVE, TRACKMOUSEEVENT, VK_BACK, VK_CONTROL, VK_D, VK_DOWN, VK_ESCAPE,
     VK_LEFT, VK_OEM_2, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
 };
-use windows::Win32::UI::Shell::IVirtualDesktopManager;
+use windows::Win32::UI::Shell::{IVirtualDesktopManager, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, DrawIconEx,
     EnumWindows, GetClassNameW, GetClientRect, GetMessageW, GetShellWindow, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadIconW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer,
+    IsWindow, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadIconW, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    DI_NORMAL, GWLP_USERDATA, GWL_EXSTYLE, HICON, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW,
-    IDI_APPLICATION, MSG, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOMOVE, SWP_NOSIZE,
-    SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
-    WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONUP,
-    WM_SETICON, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    DI_NORMAL, GWLP_USERDATA, GWL_EXSTYLE, HICON, HTTRANSPARENT, HWND_TOP, HWND_TOPMOST, ICON_BIG,
+    ICON_SMALL, IDC_ARROW, IDI_APPLICATION, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MSG,
+    SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
+    WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETICON, WM_TIMER,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 const HOTKEY_ID: i32 = 0x4d57;
 const SPLASH_TIMER_ID: usize = 0x4d58;
 const CLOSE_REFRESH_TIMER_ID: usize = 0x4d59;
 const APP_SCAN_TIMER_ID: usize = 0x4d5a;
+const HIGHLIGHT_TIMER_ID: usize = 0x4d5b;
+const UPDATE_CHECK_TIMER_ID: usize = 0x4d5c;
 const SPLASH_DURATION_MS: u32 = 2400;
 const CLOSE_REFRESH_POLL_MS: u32 = 250;
 const CLOSE_REFRESH_ATTEMPTS: u8 = 20;
 const APP_SCAN_POLL_MS: u32 = 100;
+const UPDATE_CHECK_POLL_MS: u32 = 250;
+const HIGHLIGHT_DURATION_MS: u32 = 900;
+const HIGHLIGHT_SECOND_TAP_MS: u64 = 1600;
+const HIGHLIGHT_BORDER_PX: i32 = 6;
 const WM_MOUSELEAVE_MESSAGE: u32 = 0x02A3;
 const MAX_RESULTS: usize = 8;
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const GITHUB_RELEASES_URL: PCWSTR = w!("https://github.com/eviltester/mega-win-alt-tab/releases");
 const KEY_F: u32 = b'F' as u32;
+const KEY_S: u32 = b'S' as u32;
 const KEY_W: u32 = b'W' as u32;
-const HELP_LINES: [&str; 11] = [
+const HELP_LINES: [&str; 12] = [
+    concat!("Version ", env!("CARGO_PKG_VERSION")),
     "Esc - close",
     "Up / Down - move selection",
     "Enter - select or launch",
-    "Right - bring selected window to top",
-    "Left - move selected window to next screen",
+    "Left / Right - show without focus; second tap highlights",
     "Ctrl + F - maximize or restore selected window",
+    "Ctrl + S - minimize selected window",
     "Ctrl + W - close selected window",
-    "Ctrl + Right - increase thumbnails",
-    "Ctrl + Left - decrease thumbnails",
+    "Ctrl + Left - move selected window to previous screen in layout",
+    "Ctrl + Right - move selected window to next screen in layout",
     "Ctrl + D - search all desktops",
     "Ctrl + ? / Ctrl + / - app launcher mode",
 ];
@@ -133,6 +150,7 @@ const THUMBNAIL_SIZES: [ThumbnailSize; 4] = [
     },
 ];
 const CLASS_NAME: PCWSTR = w!("MegaWinAltTabOverlay");
+const HIGHLIGHT_CLASS_NAME: PCWSTR = w!("MegaWinAltTabHighlight");
 const WINDOW_TITLE: PCWSTR = w!("Mega Win Alt Tab");
 
 pub fn run() -> Result<()> {
@@ -157,6 +175,15 @@ pub fn run() -> Result<()> {
             ..Default::default()
         };
         let _ = RegisterClassW(&class);
+        let highlight_class = WNDCLASSW {
+            hCursor: cursor,
+            hInstance: instance.into(),
+            lpszClassName: HIGHLIGHT_CLASS_NAME,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(highlight_wnd_proc),
+            ..Default::default()
+        };
+        let _ = RegisterClassW(&highlight_class);
 
         let bridge = ExtensionBridge::start().map_err(to_win_error)?;
         let state = Rc::new(RefCell::new(AppState::new(bridge, icon, owns_icon)));
@@ -232,12 +259,20 @@ struct AppState {
     app_scan_completed: bool,
     app_scan_rx: Option<Receiver<Vec<AppEntry>>>,
     scan_apps_after_paint: bool,
+    update_check_completed: bool,
+    update_check_rx: Option<Receiver<Option<UpdateInfo>>>,
+    available_update: Option<UpdateInfo>,
+    update_link_hovered: bool,
+    update_link_rect: RECT,
     windows: Vec<WindowEntry>,
     accessibility_tabs: Vec<TabEntry>,
     results: Vec<SearchResult>,
     thumbnails: HashMap<isize, isize>,
     original_window_rects: HashMap<isize, RECT>,
     pending_close_windows: HashMap<isize, u8>,
+    highlight_windows: [HWND; 4],
+    last_peek_target: Option<isize>,
+    last_peek_at: Option<Instant>,
     row_layouts: Vec<RowLayout>,
     bridge: ExtensionBridge,
     tray_icon_installed: bool,
@@ -283,12 +318,20 @@ impl AppState {
             app_scan_completed: false,
             app_scan_rx: None,
             scan_apps_after_paint: false,
+            update_check_completed: false,
+            update_check_rx: None,
+            available_update: None,
+            update_link_hovered: false,
+            update_link_rect: RECT::default(),
             windows: Vec::new(),
             accessibility_tabs: Vec::new(),
             results: Vec::new(),
             thumbnails: HashMap::new(),
             original_window_rects: HashMap::new(),
             pending_close_windows: HashMap::new(),
+            highlight_windows: [HWND(null_mut()); 4],
+            last_peek_target: None,
+            last_peek_at: None,
             row_layouts: Vec::new(),
             bridge,
             tray_icon_installed: false,
@@ -385,7 +428,10 @@ impl AppState {
         self.original_window_rects.clear();
         self.pending_close_windows.clear();
         self.scan_apps_after_paint = false;
+        self.last_peek_target = None;
+        self.last_peek_at = None;
         let _ = KillTimer(self.hwnd, CLOSE_REFRESH_TIMER_ID);
+        self.hide_attention_border();
         self.unregister_thumbnails();
         let _ = ShowWindow(self.hwnd, SW_HIDE);
     }
@@ -451,6 +497,52 @@ impl AppState {
         }
     }
 
+    unsafe fn start_update_check_if_needed(&mut self) {
+        if self.update_check_completed || self.update_check_rx.is_some() {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        self.update_check_rx = Some(receiver);
+        let _ = SetTimer(self.hwnd, UPDATE_CHECK_TIMER_ID, UPDATE_CHECK_POLL_MS, None);
+        let _ = thread::spawn(move || {
+            let _ = sender.send(check_for_update(APP_VERSION));
+        });
+    }
+
+    unsafe fn poll_update_check(&mut self) {
+        let Some(update_result) = self
+            .update_check_rx
+            .as_ref()
+            .map(|receiver| receiver.try_recv())
+        else {
+            return;
+        };
+
+        match update_result {
+            Ok(update) => {
+                self.available_update = update;
+                self.update_check_completed = true;
+                self.update_check_rx = None;
+                let _ = KillTimer(self.hwnd, UPDATE_CHECK_TIMER_ID);
+                if self.available_update.is_some() && self.visible && !self.splash_visible {
+                    if self.tray_icon_installed {
+                        if let Some(update) = &self.available_update {
+                            show_update_notification(self.hwnd, &update.latest_version);
+                        }
+                    }
+                    let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.update_check_completed = true;
+                self.update_check_rx = None;
+                let _ = KillTimer(self.hwnd, UPDATE_CHECK_TIMER_ID);
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
     fn rebuild_results(&mut self) {
         self.results = match self.mode {
             OverlayMode::WindowsAndTabs => build_results_with_options(
@@ -509,6 +601,7 @@ impl AppState {
                 let _ = InvalidateRect(self.hwnd, None, BOOL(1));
             }
             key if ctrl_down && key == KEY_F => return self.selected_toggle_maximize(),
+            key if ctrl_down && key == KEY_S => return self.selected_minimize_window(),
             key if ctrl_down && key == KEY_W => return self.selected_close_window(),
             key if ctrl_down && is_app_mode_toggle_key(key) => self.toggle_app_mode(),
             key if ctrl_down
@@ -517,8 +610,12 @@ impl AppState {
             {
                 self.toggle_all_desktops()
             }
-            key if ctrl_down && key == VK_RIGHT.0 as u32 => self.increase_thumbnail_size(),
-            key if ctrl_down && key == VK_LEFT.0 as u32 => self.decrease_thumbnail_size(),
+            key if ctrl_down && key == VK_RIGHT.0 as u32 => {
+                return self.selected_move_to_monitor(MonitorMoveDirection::Next);
+            }
+            key if ctrl_down && key == VK_LEFT.0 as u32 => {
+                return self.selected_move_to_monitor(MonitorMoveDirection::Previous);
+            }
             key if key == VK_UP.0 as u32 => {
                 if !self.results.is_empty() {
                     self.selected = self.selected.saturating_sub(1);
@@ -531,9 +628,10 @@ impl AppState {
                     let _ = InvalidateRect(self.hwnd, None, BOOL(1));
                 }
             }
-            key if key == VK_LEFT.0 as u32 => return self.selected_move_to_next_monitor(),
-            key if self.mode == OverlayMode::WindowsAndTabs && key == VK_RIGHT.0 as u32 => {
-                return self.selected_activation(true);
+            key if self.mode == OverlayMode::WindowsAndTabs
+                && (key == VK_LEFT.0 as u32 || key == VK_RIGHT.0 as u32) =>
+            {
+                return self.selected_peek_window();
             }
             key if key == VK_RETURN.0 as u32 => {
                 let action = self.selected_activation(false);
@@ -568,20 +666,6 @@ impl AppState {
         let _ = InvalidateRect(self.hwnd, None, BOOL(1));
     }
 
-    unsafe fn increase_thumbnail_size(&mut self) {
-        if self.thumbnail_size_index + 1 < THUMBNAIL_SIZES.len() {
-            self.thumbnail_size_index += 1;
-            let _ = InvalidateRect(self.hwnd, None, BOOL(1));
-        }
-    }
-
-    unsafe fn decrease_thumbnail_size(&mut self) {
-        if self.thumbnail_size_index > 0 {
-            self.thumbnail_size_index -= 1;
-            let _ = InvalidateRect(self.hwnd, None, BOOL(1));
-        }
-    }
-
     fn thumbnail_size(&self) -> ThumbnailSize {
         THUMBNAIL_SIZES[self.thumbnail_size_index]
     }
@@ -608,6 +692,32 @@ impl AppState {
             bridge: self.bridge.clone(),
             overlay_hwnd: self.hwnd,
             restore_overlay_focus,
+            highlight_target: None,
+        }))
+    }
+
+    fn selected_peek_window(&mut self) -> DeferredAction {
+        let Some(result) = self.results.get(self.selected).cloned() else {
+            return DeferredAction::None;
+        };
+        let Some(peek_target) = selected_move_target_hwnd(&result, &self.windows) else {
+            return DeferredAction::None;
+        };
+        let now = Instant::now();
+        let highlight_target = should_highlight_repeated_peek(
+            self.last_peek_target,
+            self.last_peek_at,
+            Some(peek_target),
+            now,
+        )
+        .then_some(peek_target);
+        self.last_peek_target = Some(peek_target);
+        self.last_peek_at = Some(now);
+
+        DeferredAction::PeekWindow(Box::new(PeekWindowRequest {
+            hwnd: peek_target,
+            overlay_hwnd: self.hwnd,
+            highlight_target,
         }))
     }
 
@@ -620,6 +730,20 @@ impl AppState {
         };
 
         DeferredAction::ToggleMaximize(Box::new(ToggleMaximizeRequest {
+            hwnd,
+            overlay_hwnd: self.hwnd,
+        }))
+    }
+
+    fn selected_minimize_window(&self) -> DeferredAction {
+        let Some(result) = self.results.get(self.selected).cloned() else {
+            return DeferredAction::None;
+        };
+        let Some(hwnd) = selected_move_target_hwnd(&result, &self.windows) else {
+            return DeferredAction::None;
+        };
+
+        DeferredAction::MinimizeWindow(Box::new(MinimizeWindowRequest {
             hwnd,
             overlay_hwnd: self.hwnd,
         }))
@@ -678,7 +802,10 @@ impl AppState {
         }
     }
 
-    unsafe fn selected_move_to_next_monitor(&mut self) -> DeferredAction {
+    unsafe fn selected_move_to_monitor(
+        &mut self,
+        direction: MonitorMoveDirection,
+    ) -> DeferredAction {
         let Some(result) = self.results.get(self.selected).cloned() else {
             return DeferredAction::None;
         };
@@ -696,11 +823,95 @@ impl AppState {
             }
         };
 
-        DeferredAction::MoveToNextMonitor(Box::new(MoveWindowRequest {
+        DeferredAction::MoveToMonitor(Box::new(MoveWindowRequest {
             hwnd,
             overlay_hwnd: self.hwnd,
             original_rect,
+            direction,
         }))
+    }
+
+    unsafe fn show_attention_border(&mut self, target: isize) {
+        let target_hwnd = hwnd_from_isize(target);
+        if !IsWindow(target_hwnd).as_bool() {
+            return;
+        }
+        let Some(rect) = highlight_rect_for_window(target_hwnd) else {
+            return;
+        };
+        let bounds = monitor_rect_for_window(target_hwnd).unwrap_or(rect);
+        if !self.ensure_highlight_windows() {
+            return;
+        }
+
+        let positions = attention_border_positions(rect, bounds, HIGHLIGHT_BORDER_PX);
+
+        for (window, rect) in self.highlight_windows.iter().copied().zip(positions) {
+            let _ = SetWindowPos(
+                window,
+                HWND_TOPMOST,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOACTIVATE,
+            );
+            let _ = ShowWindow(window, SW_SHOW);
+            let _ = InvalidateRect(window, None, BOOL(1));
+        }
+        let _ = SetTimer(self.hwnd, HIGHLIGHT_TIMER_ID, HIGHLIGHT_DURATION_MS, None);
+        restore_overlay_focus(self.hwnd);
+    }
+
+    unsafe fn hide_attention_border(&mut self) {
+        let _ = KillTimer(self.hwnd, HIGHLIGHT_TIMER_ID);
+        for window in self.highlight_windows.iter().copied() {
+            if !window.0.is_null() {
+                let _ = ShowWindow(window, SW_HIDE);
+            }
+        }
+    }
+
+    unsafe fn destroy_highlight_windows(&mut self) {
+        let _ = KillTimer(self.hwnd, HIGHLIGHT_TIMER_ID);
+        for window in self.highlight_windows.iter_mut() {
+            if !window.0.is_null() {
+                let _ = DestroyWindow(*window);
+                *window = HWND(null_mut());
+            }
+        }
+    }
+
+    unsafe fn ensure_highlight_windows(&mut self) -> bool {
+        let Ok(instance) = windows::Win32::System::LibraryLoader::GetModuleHandleW(None) else {
+            return false;
+        };
+
+        for window in self.highlight_windows.iter_mut() {
+            if !window.0.is_null() && IsWindow(*window).as_bool() {
+                continue;
+            }
+
+            let Ok(created) = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                HIGHLIGHT_CLASS_NAME,
+                w!("Mega Win Alt Tab Highlight"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                instance,
+                None,
+            ) else {
+                return false;
+            };
+            *window = created;
+        }
+
+        true
     }
 
     unsafe fn remove_tray_icon(&mut self) {
@@ -730,6 +941,7 @@ impl AppState {
                 self.scan_apps_after_paint = false;
                 self.start_app_scan_if_needed();
             }
+            self.start_update_check_if_needed();
         }
 
         let _ = EndPaint(self.hwnd, &ps);
@@ -881,6 +1093,42 @@ impl AppState {
 
         let counter_font = make_font(14, FW_NORMAL.0 as i32);
         let old_counter = SelectObject(hdc, counter_font);
+        if let Some(update) = &self.available_update {
+            self.update_link_rect = RECT {
+                left: search_rect.left + 12,
+                top: search_rect.bottom + 5,
+                right: search_rect.right - 120,
+                bottom: search_rect.bottom + 23,
+            };
+            SetTextColor(
+                hdc,
+                if self.update_link_hovered {
+                    rgb(255, 232, 126)
+                } else {
+                    rgb(255, 208, 64)
+                },
+            );
+            draw_text(
+                hdc,
+                &update_link_text(&update.latest_version),
+                self.update_link_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+            if self.update_link_hovered {
+                fill_rect(
+                    hdc,
+                    RECT {
+                        left: self.update_link_rect.left,
+                        top: self.update_link_rect.bottom - 2,
+                        right: self.update_link_rect.right,
+                        bottom: self.update_link_rect.bottom - 1,
+                    },
+                    rgb(255, 232, 126),
+                );
+            }
+        } else {
+            self.update_link_rect = RECT::default();
+        }
         SetTextColor(hdc, rgb(168, 176, 184));
         draw_text(
             hdc,
@@ -1203,14 +1451,27 @@ impl AppState {
 
         let help_hovered = point_in_rect(self.help_rect, x, y);
         let close_hovered = point_in_rect(self.close_rect, x, y);
-        if help_hovered != self.help_hovered || close_hovered != self.close_hovered {
+        let update_link_hovered =
+            self.available_update.is_some() && point_in_rect(self.update_link_rect, x, y);
+        if help_hovered != self.help_hovered
+            || close_hovered != self.close_hovered
+            || update_link_hovered != self.update_link_hovered
+        {
             self.help_hovered = help_hovered;
             self.close_hovered = close_hovered;
+            self.update_link_hovered = update_link_hovered;
             let _ = InvalidateRect(self.hwnd, None, BOOL(1));
         }
     }
 
     unsafe fn on_left_button_up(&mut self, x: i32, y: i32) {
+        if self.visible
+            && self.available_update.is_some()
+            && point_in_rect(self.update_link_rect, x, y)
+        {
+            open_github_releases(self.hwnd);
+            return;
+        }
         if self.visible && point_in_rect(self.close_rect, x, y) {
             self.hide();
         }
@@ -1218,9 +1479,10 @@ impl AppState {
 
     unsafe fn on_mouse_leave(&mut self) {
         self.mouse_tracking = false;
-        if self.help_hovered || self.close_hovered {
+        if self.help_hovered || self.close_hovered || self.update_link_hovered {
             self.help_hovered = false;
             self.close_hovered = false;
+            self.update_link_hovered = false;
             let _ = InvalidateRect(self.hwnd, None, BOOL(1));
         }
     }
@@ -1231,6 +1493,7 @@ impl Drop for AppState {
         unsafe {
             self.remove_tray_icon();
             self.unregister_thumbnails();
+            self.destroy_highlight_windows();
             if !self.hwnd.0.is_null() {
                 let _ = UnregisterHotKey(self.hwnd, HOTKEY_ID);
             }
@@ -1245,7 +1508,9 @@ enum DeferredAction {
     None,
     Activate(Box<ActivationRequest>),
     CloseWindow(Box<CloseWindowRequest>),
-    MoveToNextMonitor(Box<MoveWindowRequest>),
+    MinimizeWindow(Box<MinimizeWindowRequest>),
+    MoveToMonitor(Box<MoveWindowRequest>),
+    PeekWindow(Box<PeekWindowRequest>),
     ToggleMaximize(Box<ToggleMaximizeRequest>),
 }
 
@@ -1255,15 +1520,28 @@ struct ActivationRequest {
     bridge: ExtensionBridge,
     overlay_hwnd: HWND,
     restore_overlay_focus: bool,
+    highlight_target: Option<isize>,
 }
 
 struct MoveWindowRequest {
     hwnd: isize,
     overlay_hwnd: HWND,
     original_rect: RECT,
+    direction: MonitorMoveDirection,
+}
+
+struct PeekWindowRequest {
+    hwnd: isize,
+    overlay_hwnd: HWND,
+    highlight_target: Option<isize>,
 }
 
 struct CloseWindowRequest {
+    hwnd: isize,
+    overlay_hwnd: HWND,
+}
+
+struct MinimizeWindowRequest {
     hwnd: isize,
     overlay_hwnd: HWND,
 }
@@ -1274,27 +1552,41 @@ struct ToggleMaximizeRequest {
 }
 
 impl DeferredAction {
-    unsafe fn run(self) -> bool {
+    unsafe fn run(self) -> DeferredOutcome {
         match self {
-            Self::None => false,
-            Self::Activate(request) => {
-                run_activation(*request);
-                false
-            }
+            Self::None => DeferredOutcome::default(),
+            Self::Activate(request) => DeferredOutcome {
+                highlight_target: run_activation(*request),
+                ..Default::default()
+            },
             Self::CloseWindow(request) => {
                 let _ = run_close_window(*request);
-                false
+                DeferredOutcome::default()
             }
-            Self::MoveToNextMonitor(request) => {
-                let _ = run_move_to_next_monitor(*request);
-                false
+            Self::MinimizeWindow(request) => {
+                run_minimize_window(*request);
+                DeferredOutcome::default()
             }
+            Self::MoveToMonitor(request) => {
+                let _ = run_move_to_monitor(*request);
+                DeferredOutcome::default()
+            }
+            Self::PeekWindow(request) => DeferredOutcome {
+                highlight_target: run_peek_window(*request),
+                ..Default::default()
+            },
             Self::ToggleMaximize(request) => {
                 run_toggle_maximize(*request);
-                false
+                DeferredOutcome::default()
             }
         }
     }
+}
+
+#[derive(Default)]
+struct DeferredOutcome {
+    refresh: bool,
+    highlight_target: Option<isize>,
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -1311,6 +1603,27 @@ unsafe extern "system" fn wnd_proc(
             log_runtime_issue("Recovered from a panic while processing a Windows message.");
             LRESULT(0)
         }
+    }
+}
+
+unsafe extern "system" fn highlight_wnd_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            fill_rect(hdc, rect, rgb(255, 208, 64));
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
 }
 
@@ -1356,9 +1669,15 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
                 DeferredAction::None,
                 |state| state.on_key_down(wparam.0 as u32),
             );
-            if action.run() {
+            let outcome = action.run();
+            if outcome.refresh {
                 with_state_mut(state_ptr, "refresh after deferred action", (), |state| {
                     state.refresh()
+                });
+            }
+            if let Some(target) = outcome.highlight_target {
+                with_state_mut(state_ptr, "show attention border", (), |state| {
+                    state.show_attention_border(target)
                 });
             }
             return LRESULT(0);
@@ -1420,6 +1739,18 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
                 });
                 return LRESULT(0);
             }
+            if wparam.0 == HIGHLIGHT_TIMER_ID {
+                with_state_mut(state_ptr, "hide attention border", (), |state| {
+                    state.hide_attention_border()
+                });
+                return LRESULT(0);
+            }
+            if wparam.0 == UPDATE_CHECK_TIMER_ID {
+                with_state_mut(state_ptr, "poll update check", (), |state| {
+                    state.poll_update_check()
+                });
+                return LRESULT(0);
+            }
         }
         WM_DESTROY => {
             let state = Rc::from_raw(state_ptr);
@@ -1442,6 +1773,9 @@ unsafe fn handle_tray_menu_command(hwnd: HWND) {
         TrayMenuCommand::None => {}
         TrayMenuCommand::ToggleStartup => {
             let enabled = is_run_at_startup_enabled();
+            if !enabled {
+                prompt_to_remove_legacy_startup_entries(hwnd);
+            }
             if !set_run_at_startup(!enabled) {
                 log_runtime_issue("Failed to update the Windows startup registry value.");
             }
@@ -1450,6 +1784,61 @@ unsafe fn handle_tray_menu_command(hwnd: HWND) {
             let _ = DestroyWindow(hwnd);
         }
     }
+}
+
+unsafe fn prompt_to_remove_legacy_startup_entries(hwnd: HWND) {
+    let entries = legacy_startup_entries();
+    if entries.is_empty() {
+        return;
+    }
+
+    if !confirm_remove_legacy_startup_entries(hwnd, &entries) {
+        return;
+    }
+
+    if !remove_startup_entries(&entries) {
+        log_runtime_issue("Failed to remove one or more older Windows startup registry values.");
+    }
+}
+
+unsafe fn confirm_remove_legacy_startup_entries(
+    hwnd: HWND,
+    entries: &[LegacyStartupEntry],
+) -> bool {
+    let title = to_wide_null("Mega Win Alt Tab startup cleanup");
+    let message = to_wide_null(&legacy_startup_prompt(entries));
+    MessageBoxW(
+        hwnd,
+        PCWSTR(message.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+    ) == IDYES
+}
+
+fn legacy_startup_prompt(entries: &[LegacyStartupEntry]) -> String {
+    const MAX_PROMPT_ENTRIES: usize = 8;
+    let mut prompt = String::from(
+        "Mega Win Alt Tab found possible older startup entries created by earlier release file names.\n\n",
+    );
+    prompt.push_str("Remove these old entries before setting this copy to run at startup?\n\n");
+
+    for entry in entries.iter().take(MAX_PROMPT_ENTRIES) {
+        prompt.push_str(&format!(
+            "Name: {}\nPath: {}\n\n",
+            entry.name, entry.command
+        ));
+    }
+
+    if entries.len() > MAX_PROMPT_ENTRIES {
+        prompt.push_str(&format!(
+            "...and {} more possible older startup entries.\n\n",
+            entries.len() - MAX_PROMPT_ENTRIES
+        ));
+    }
+
+    prompt.push_str("Yes removes the listed entries and sets this copy to run at startup.\n");
+    prompt.push_str("No leaves them alone and still sets this copy to run at startup.");
+    prompt
 }
 
 unsafe fn with_state_mut<T>(
@@ -1589,6 +1978,110 @@ unsafe fn is_cloaked(hwnd: HWND) -> bool {
     )
     .is_ok()
         && cloaked != 0
+}
+
+unsafe fn highlight_rect_for_window(hwnd: HWND) -> Option<RECT> {
+    extended_frame_bounds(hwnd)
+        .or_else(|| current_window_rect(hwnd))
+        .filter(|rect| rect_is_usable(*rect))
+        .or_else(|| monitor_rect_for_window(hwnd))
+}
+
+unsafe fn extended_frame_bounds(hwnd: HWND) -> Option<RECT> {
+    let mut rect = RECT::default();
+    DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_EXTENDED_FRAME_BOUNDS,
+        &mut rect as *mut RECT as *mut c_void,
+        size_of::<RECT>() as u32,
+    )
+    .is_ok()
+    .then_some(rect)
+    .filter(|rect| rect_is_usable(*rect))
+}
+
+fn attention_border_positions(rect: RECT, bounds: RECT, thickness: i32) -> [RECT; 4] {
+    let thickness = thickness.max(1);
+    let bounds = if rect_is_usable(bounds) { bounds } else { rect };
+    let (horizontal_left, horizontal_right) = bounded_span(
+        rect.left - thickness,
+        rect.right + thickness,
+        bounds.left,
+        bounds.right,
+        thickness,
+    );
+    let (vertical_top, vertical_bottom) =
+        bounded_span(rect.top, rect.bottom, bounds.top, bounds.bottom, thickness);
+    let top = clamped_strip_start(rect.top - thickness, bounds.top, bounds.bottom, thickness);
+    let bottom = if rect.bottom + thickness > bounds.bottom {
+        clamped_strip_start(
+            rect.bottom - thickness,
+            bounds.top,
+            bounds.bottom,
+            thickness,
+        )
+    } else {
+        clamped_strip_start(rect.bottom, bounds.top, bounds.bottom, thickness)
+    };
+    let left = clamped_strip_start(rect.left - thickness, bounds.left, bounds.right, thickness);
+    let right = if rect.right + thickness > bounds.right {
+        clamped_strip_start(rect.right - thickness, bounds.left, bounds.right, thickness)
+    } else {
+        clamped_strip_start(rect.right, bounds.left, bounds.right, thickness)
+    };
+
+    [
+        RECT {
+            left: horizontal_left,
+            top,
+            right: horizontal_right,
+            bottom: top + thickness,
+        },
+        RECT {
+            left: horizontal_left,
+            top: bottom,
+            right: horizontal_right,
+            bottom: bottom + thickness,
+        },
+        RECT {
+            left,
+            top: vertical_top,
+            right: left + thickness,
+            bottom: vertical_bottom,
+        },
+        RECT {
+            left: right,
+            top: vertical_top,
+            right: right + thickness,
+            bottom: vertical_bottom,
+        },
+    ]
+}
+
+fn bounded_span(start: i32, end: i32, min: i32, max: i32, minimum_size: i32) -> (i32, i32) {
+    let minimum_size = minimum_size.max(1);
+    if max <= min + minimum_size {
+        return (min, max.max(min + 1));
+    }
+
+    let start = start.clamp(min, max);
+    let end = end.clamp(min, max);
+    if end - start >= minimum_size {
+        return (start, end);
+    }
+
+    let end = (start + minimum_size).min(max);
+    let start = (end - minimum_size).max(min);
+    (start, end)
+}
+
+fn clamped_strip_start(value: i32, min: i32, max: i32, size: i32) -> i32 {
+    let size = size.max(1);
+    value.clamp(min, (max - size).max(min))
+}
+
+fn rect_is_usable(rect: RECT) -> bool {
+    rect.right > rect.left && rect.bottom > rect.top
 }
 
 unsafe fn get_window_text(hwnd: HWND) -> String {
@@ -1865,7 +2358,7 @@ unsafe fn activate_window_from_overlay(hwnd: HWND, overlay_hwnd: HWND) {
     activate_window(hwnd);
 }
 
-unsafe fn run_activation(request: ActivationRequest) {
+unsafe fn run_activation(request: ActivationRequest) -> Option<isize> {
     match request.result.target {
         ActivationTarget::Window { hwnd } => {
             activate_window_from_overlay(hwnd_from_isize(hwnd), request.overlay_hwnd);
@@ -1908,6 +2401,7 @@ unsafe fn run_activation(request: ActivationRequest) {
     if request.restore_overlay_focus {
         restore_overlay_focus(request.overlay_hwnd);
     }
+    request.highlight_target
 }
 
 unsafe fn run_close_window(request: CloseWindowRequest) -> bool {
@@ -1920,6 +2414,17 @@ unsafe fn run_close_window(request: CloseWindowRequest) -> bool {
     let close_sent = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok();
     restore_overlay_focus(request.overlay_hwnd);
     close_sent
+}
+
+unsafe fn run_minimize_window(request: MinimizeWindowRequest) {
+    let hwnd = hwnd_from_isize(request.hwnd);
+    if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+
+    move_window_to_overlay_desktop_if_needed(hwnd, request.overlay_hwnd);
+    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+    restore_overlay_focus(request.overlay_hwnd);
 }
 
 unsafe fn run_toggle_maximize(request: ToggleMaximizeRequest) {
@@ -1938,7 +2443,7 @@ unsafe fn run_toggle_maximize(request: ToggleMaximizeRequest) {
     restore_overlay_focus(request.overlay_hwnd);
 }
 
-unsafe fn run_move_to_next_monitor(request: MoveWindowRequest) -> bool {
+unsafe fn run_move_to_monitor(request: MoveWindowRequest) -> bool {
     let hwnd = hwnd_from_isize(request.hwnd);
     if !IsWindow(hwnd).as_bool() {
         return false;
@@ -1946,11 +2451,39 @@ unsafe fn run_move_to_next_monitor(request: MoveWindowRequest) -> bool {
 
     move_window_to_overlay_desktop_if_needed(hwnd, request.overlay_hwnd);
 
-    let moved = move_window_to_next_monitor(hwnd, request.original_rect);
+    let moved = move_window_to_monitor(hwnd, request.original_rect, request.direction);
     if moved {
         restore_overlay_focus(request.overlay_hwnd);
     }
     moved
+}
+
+unsafe fn run_peek_window(request: PeekWindowRequest) -> Option<isize> {
+    let hwnd = hwnd_from_isize(request.hwnd);
+    if !IsWindow(hwnd).as_bool() {
+        restore_overlay_focus(request.overlay_hwnd);
+        return None;
+    }
+
+    move_window_to_overlay_desktop_if_needed(hwnd, request.overlay_hwnd);
+    show_window_without_activation(hwnd);
+    restore_overlay_focus(request.overlay_hwnd);
+    request.highlight_target
+}
+
+unsafe fn show_window_without_activation(hwnd: HWND) {
+    if IsIconic(hwnd).as_bool() {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    let _ = SetWindowPos(
+        hwnd,
+        HWND_TOP,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
 }
 
 fn selected_move_target_hwnd(result: &SearchResult, windows: &[WindowEntry]) -> Option<isize> {
@@ -1959,6 +2492,20 @@ fn selected_move_target_hwnd(result: &SearchResult, windows: &[WindowEntry]) -> 
         ActivationTarget::Tab { parent_hwnd, .. } => *parent_hwnd,
         ActivationTarget::App { .. } => running_window_for_app(&result.title, windows),
     }
+}
+
+fn should_highlight_repeated_peek(
+    last_target: Option<isize>,
+    last_at: Option<Instant>,
+    target: Option<isize>,
+    now: Instant,
+) -> bool {
+    let (Some(last_target), Some(last_at), Some(target)) = (last_target, last_at, target) else {
+        return false;
+    };
+
+    last_target == target
+        && now.duration_since(last_at) <= Duration::from_millis(HIGHLIGHT_SECOND_TAP_MS)
 }
 
 fn running_window_for_app(app_title: &str, windows: &[WindowEntry]) -> Option<isize> {
@@ -2000,6 +2547,22 @@ unsafe fn restore_overlay_focus(hwnd: HWND) {
     let _ = SetForegroundWindow(hwnd);
     let _ = SetFocus(hwnd);
     let _ = InvalidateRect(hwnd, None, BOOL(1));
+}
+
+unsafe fn open_github_releases(hwnd: HWND) -> bool {
+    let result = ShellExecuteW(
+        hwnd,
+        w!("open"),
+        GITHUB_RELEASES_URL,
+        PCWSTR::null(),
+        PCWSTR::null(),
+        SW_SHOWNORMAL,
+    );
+    result.0 as isize > 32
+}
+
+fn update_link_text(latest_version: &str) -> String {
+    format!("Update available: {latest_version} - open releases")
 }
 
 fn result_thumbnail_hwnd(result: &SearchResult) -> Option<isize> {
@@ -2147,6 +2710,10 @@ unsafe fn draw_text(hdc: HDC, text: &str, mut rect: RECT, format: DRAW_TEXT_FORM
 
 fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().collect()
+}
+
+fn to_wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn hwnd_from_isize(value: isize) -> HWND {
@@ -2335,6 +2902,132 @@ mod tests {
     }
 
     #[test]
+    fn repeated_peek_highlights_same_target_within_short_window() {
+        let first_tap = Instant::now();
+        let second_tap = first_tap + Duration::from_millis(HIGHLIGHT_SECOND_TAP_MS - 1);
+        let late_tap = first_tap + Duration::from_millis(HIGHLIGHT_SECOND_TAP_MS + 1);
+
+        assert!(should_highlight_repeated_peek(
+            Some(42),
+            Some(first_tap),
+            Some(42),
+            second_tap
+        ));
+        assert!(!should_highlight_repeated_peek(
+            Some(42),
+            Some(first_tap),
+            Some(77),
+            second_tap
+        ));
+        assert!(!should_highlight_repeated_peek(
+            Some(42),
+            Some(first_tap),
+            Some(42),
+            late_tap
+        ));
+        assert!(!should_highlight_repeated_peek(
+            None,
+            Some(first_tap),
+            Some(42),
+            second_tap
+        ));
+    }
+
+    #[test]
+    fn attention_border_stays_outside_normal_window_when_space_allows() {
+        let rect = RECT {
+            left: 100,
+            top: 100,
+            right: 500,
+            bottom: 400,
+        };
+        let bounds = RECT {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 800,
+        };
+
+        assert_eq!(
+            attention_border_positions(rect, bounds, 6),
+            [
+                RECT {
+                    left: 94,
+                    top: 94,
+                    right: 506,
+                    bottom: 100,
+                },
+                RECT {
+                    left: 94,
+                    top: 400,
+                    right: 506,
+                    bottom: 406,
+                },
+                RECT {
+                    left: 94,
+                    top: 100,
+                    right: 100,
+                    bottom: 400,
+                },
+                RECT {
+                    left: 500,
+                    top: 100,
+                    right: 506,
+                    bottom: 400,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn attention_border_moves_inside_maximized_window_bounds() {
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+
+        assert_eq!(
+            attention_border_positions(rect, rect, 6),
+            [
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 6,
+                },
+                RECT {
+                    left: 0,
+                    top: 1074,
+                    right: 1920,
+                    bottom: 1080,
+                },
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 6,
+                    bottom: 1080,
+                },
+                RECT {
+                    left: 1914,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn update_link_text_names_version_and_destination() {
+        assert_eq!(
+            update_link_text("v1.2.3"),
+            "Update available: v1.2.3 - open releases"
+        );
+    }
+
+    #[test]
     fn selection_status_is_one_based_and_clamped() {
         assert_eq!(selection_status_text(0, 0), "0 / 0");
         assert_eq!(selection_status_text(0, 20), "1 / 20");
@@ -2377,6 +3070,23 @@ mod tests {
         assert!(has_startup_arg(["mega-win-alt-tab.exe", "--startup"]));
         assert!(!has_startup_arg(["mega-win-alt-tab.exe"]));
         assert!(!has_startup_arg(["mega-win-alt-tab.exe", "--startup-now"]));
+    }
+
+    #[test]
+    fn legacy_startup_prompt_lists_entry_names_and_paths() {
+        let entries = vec![LegacyStartupEntry {
+            name: "mega-win-alt-tab-v1.0.0-windows-x64.exe".to_string(),
+            command: r#""C:\Downloads\mega-win-alt-tab-v1.0.0-windows-x64.exe" --startup"#
+                .to_string(),
+        }];
+
+        let prompt = legacy_startup_prompt(&entries);
+
+        assert!(prompt.contains("possible older startup entries"));
+        assert!(prompt.contains("Name: mega-win-alt-tab-v1.0.0-windows-x64.exe"));
+        assert!(prompt
+            .contains(r#"Path: "C:\Downloads\mega-win-alt-tab-v1.0.0-windows-x64.exe" --startup"#));
+        assert!(prompt.contains("No leaves them alone"));
     }
 
     #[test]

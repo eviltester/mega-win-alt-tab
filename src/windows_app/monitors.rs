@@ -10,6 +10,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MonitorMoveDirection {
+    Previous,
+    Next,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MonitorEntry {
     handle: isize,
     number: u32,
@@ -67,13 +73,18 @@ unsafe fn enumerate_monitor_entries() -> Vec<MonitorEntry> {
         });
     }
 
-    entries.sort_by(|a, b| {
-        a.number
-            .cmp(&b.number)
-            .then_with(|| a.rect.left.cmp(&b.rect.left))
-            .then_with(|| a.rect.top.cmp(&b.rect.top))
-    });
+    sort_monitor_entries_by_layout(&mut entries);
     entries
+}
+
+fn sort_monitor_entries_by_layout(entries: &mut [MonitorEntry]) {
+    entries.sort_by(|a, b| {
+        a.rect
+            .top
+            .cmp(&b.rect.top)
+            .then_with(|| a.rect.left.cmp(&b.rect.left))
+            .then_with(|| a.number.cmp(&b.number))
+    });
 }
 
 unsafe fn monitor_details(monitor: HMONITOR) -> Option<(Option<u32>, RECT)> {
@@ -100,6 +111,15 @@ pub(super) unsafe fn window_screen_number(
     monitor_numbers.get(&(monitor.0 as isize)).copied()
 }
 
+pub(super) unsafe fn monitor_rect_for_window(hwnd: HWND) -> Option<RECT> {
+    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if monitor.is_invalid() {
+        return None;
+    }
+
+    monitor_details(monitor).map(|(_, rect)| rect)
+}
+
 pub(super) unsafe fn current_window_rect(hwnd: HWND) -> Option<RECT> {
     let mut window_rect = RECT::default();
     GetWindowRect(hwnd, &mut window_rect)
@@ -107,7 +127,11 @@ pub(super) unsafe fn current_window_rect(hwnd: HWND) -> Option<RECT> {
         .then_some(window_rect)
 }
 
-pub(super) unsafe fn move_window_to_next_monitor(hwnd: HWND, original_window_rect: RECT) -> bool {
+pub(super) unsafe fn move_window_to_monitor(
+    hwnd: HWND,
+    original_window_rect: RECT,
+    direction: MonitorMoveDirection,
+) -> bool {
     let monitors = enumerate_monitor_entries();
     if monitors.len() < 2 {
         return false;
@@ -125,7 +149,8 @@ pub(super) unsafe fn move_window_to_next_monitor(hwnd: HWND, original_window_rec
         return false;
     };
     let current = monitors[current_index];
-    let next = monitors[(current_index + 1) % monitors.len()];
+    let next_index = monitor_index_after_move(current_index, monitors.len(), direction);
+    let next = monitors[next_index];
 
     let Some(window_rect) = current_window_rect(hwnd) else {
         return false;
@@ -143,6 +168,17 @@ pub(super) unsafe fn move_window_to_next_monitor(hwnd: HWND, original_window_rec
         SWP_NOZORDER | SWP_NOACTIVATE,
     )
     .is_ok()
+}
+
+fn monitor_index_after_move(
+    current_index: usize,
+    monitor_count: usize,
+    direction: MonitorMoveDirection,
+) -> usize {
+    match direction {
+        MonitorMoveDirection::Previous => (current_index + monitor_count - 1) % monitor_count,
+        MonitorMoveDirection::Next => (current_index + 1) % monitor_count,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,6 +235,26 @@ fn parse_display_number(value: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn monitor(
+        handle: isize,
+        number: u32,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    ) -> MonitorEntry {
+        MonitorEntry {
+            handle,
+            number,
+            rect: RECT {
+                left,
+                top,
+                right,
+                bottom,
+            },
+        }
+    }
 
     #[test]
     fn next_monitor_placement_preserves_offset_and_clamps_to_visible_area() {
@@ -307,5 +363,66 @@ mod tests {
         assert_eq!(parse_display_number(r"\\.\DISPLAY1"), Some(1));
         assert_eq!(parse_display_number(r"\\.\DISPLAY27"), Some(27));
         assert_eq!(parse_display_number("Display"), None);
+    }
+
+    #[test]
+    fn monitor_direction_wraps_in_screen_order() {
+        assert_eq!(
+            monitor_index_after_move(0, 3, MonitorMoveDirection::Previous),
+            2
+        );
+        assert_eq!(
+            monitor_index_after_move(1, 3, MonitorMoveDirection::Previous),
+            0
+        );
+        assert_eq!(
+            monitor_index_after_move(2, 3, MonitorMoveDirection::Next),
+            0
+        );
+        assert_eq!(
+            monitor_index_after_move(0, 3, MonitorMoveDirection::Next),
+            1
+        );
+    }
+
+    #[test]
+    fn monitor_layout_order_follows_visual_rows_not_display_numbers() {
+        let mut monitors = vec![
+            monitor(1, 1, 1920, 0, 3840, 1080),
+            monitor(2, 2, 3840, 0, 5760, 1080),
+            monitor(3, 3, 0, 0, 1920, 1080),
+            monitor(4, 4, 1920, 1080, 3840, 2160),
+        ];
+
+        sort_monitor_entries_by_layout(&mut monitors);
+
+        let numbers = monitors
+            .iter()
+            .map(|monitor| monitor.number)
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, vec![3, 1, 2, 4]);
+
+        let display_two_index = monitors
+            .iter()
+            .position(|monitor| monitor.number == 2)
+            .unwrap();
+        assert_eq!(
+            monitors[monitor_index_after_move(
+                display_two_index,
+                monitors.len(),
+                MonitorMoveDirection::Next
+            )]
+            .number,
+            4
+        );
+        assert_eq!(
+            monitors[monitor_index_after_move(
+                display_two_index,
+                monitors.len(),
+                MonitorMoveDirection::Previous
+            )]
+            .number,
+            1
+        );
     }
 }

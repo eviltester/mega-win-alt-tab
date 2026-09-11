@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, PostMessageW, SetForegroundWindow,
@@ -130,6 +130,19 @@ pub(super) unsafe fn remove_tray_icon(hwnd: HWND) {
     let _ = Shell_NotifyIconW(NIM_DELETE, &data);
 }
 
+pub(super) unsafe fn show_update_notification(hwnd: HWND, latest_version: &str) {
+    let mut data = tray_icon_data(hwnd);
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = NIIF_INFO;
+    write_wide_fixed(&mut data.szInfoTitle, "Mega Win Alt Tab update");
+    write_wide_fixed(&mut data.szInfo, &update_notification_text(latest_version));
+    let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+}
+
+fn update_notification_text(latest_version: &str) -> String {
+    format!("Version {latest_version} is available on GitHub Releases.")
+}
+
 fn tray_icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
@@ -207,6 +220,14 @@ mod tests {
         assert_eq!(
             checked_menu_flags(true),
             MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
+        );
+    }
+
+    #[test]
+    fn update_notification_names_latest_version() {
+        assert_eq!(
+            update_notification_text("v1.2.3"),
+            "Version v1.2.3 is available on GitHub Releases."
         );
     }
 }

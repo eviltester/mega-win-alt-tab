@@ -4,14 +4,18 @@ use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use windows::core::{w, PCWSTR, PWSTR};
+use windows::core::{w, Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HWND};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
+    COINIT_APARTMENTTHREADED, STGM_READ,
+};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
     HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, REG_VALUE_TYPE,
 };
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{IShellLinkW, ShellExecuteW, ShellLink};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 const APP_PATHS_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\App Paths");
@@ -77,6 +81,7 @@ fn collect_apps_from_dir(root: &Path, source: AppSource, apps: &mut Vec<AppEntry
         apps.push(AppEntry {
             name: name.to_string(),
             launch_path: path.to_string_lossy().to_string(),
+            launch_identity: shortcut_launch_identity(&path),
             source,
         });
     }
@@ -90,6 +95,53 @@ fn is_launchable_shortcut(path: &Path) -> bool {
                 || extension.eq_ignore_ascii_case("appref-ms")
                 || extension.eq_ignore_ascii_case("url")
         })
+}
+
+fn shortcut_launch_identity(path: &Path) -> Option<String> {
+    let is_shell_link = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"));
+    if !is_shell_link {
+        return None;
+    }
+
+    unsafe { shell_link_target(path) }
+}
+
+unsafe fn shell_link_target(path: &Path) -> Option<String> {
+    let _apartment = ComApartment::initialize()?;
+    let shell_link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+    let persist_file: IPersistFile = shell_link.cast().ok()?;
+    let path_wide = to_wide_z(path.to_string_lossy().as_ref());
+    persist_file
+        .Load(PCWSTR(path_wide.as_ptr()), STGM_READ)
+        .ok()?;
+
+    let mut target = vec![0u16; 32768];
+    shell_link
+        .GetPath(&mut target, std::ptr::null_mut(), 0)
+        .ok()?;
+    let target = utf16z_to_string(&target);
+    (!target.trim().is_empty()).then_some(target)
+}
+
+struct ComApartment;
+
+impl ComApartment {
+    unsafe fn initialize() -> Option<Self> {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+            .is_ok()
+            .then_some(Self)
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe {
+            CoUninitialize();
+        }
+    }
 }
 
 unsafe fn collect_apps_from_app_paths(root: HKEY, source: AppSource, apps: &mut Vec<AppEntry>) {
@@ -119,6 +171,7 @@ unsafe fn collect_apps_from_app_paths(root: HKEY, source: AppSource, apps: &mut 
             if !launch_path.trim().is_empty() {
                 apps.push(AppEntry {
                     name: app_name_from_app_path_key(&key_name),
+                    launch_identity: Some(launch_path.clone()),
                     launch_path,
                     source,
                 });
@@ -254,9 +307,11 @@ fn collect_packaged_apps(apps: &mut Vec<AppEntry>) {
             continue;
         }
 
+        let launch_path = packaged_app_launch_path(app_id);
         apps.push(AppEntry {
             name: name.to_string(),
-            launch_path: packaged_app_launch_path(app_id),
+            launch_identity: Some(launch_path.clone()),
+            launch_path,
             source: AppSource::PackagedApp,
         });
     }
@@ -320,6 +375,11 @@ pub(super) unsafe fn launch_app(hwnd: HWND, launch_path: &str) -> bool {
 
 fn to_wide_z(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
+}
+
+fn utf16z_to_string(value: &[u16]) -> String {
+    let len = value.iter().position(|ch| *ch == 0).unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..len])
 }
 
 #[cfg(test)]
