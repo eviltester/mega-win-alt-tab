@@ -1,5 +1,23 @@
 # Mega Win Alt Tab
 
+## Security Notice
+
+Mega Win Alt Tab releases are currently unsigned Windows executables. This
+project is open source, but Azure Artifact Signing requires a monthly paid plan,
+so official releases are not code-signed at this time.
+
+Some antivirus products may show false positives because Mega Win Alt Tab uses
+automation-style Windows features: it registers a global hotkey, enumerates
+visible windows and window titles, captures DWM thumbnails, uses UI Automation
+to read browser tab titles, launches selected apps and folders, writes user
+configuration files under the user profile, can add a per-user startup registry
+entry, and checks GitHub Releases for updates.
+
+Mega Win Alt Tab is not malware and is not a virus. You are welcome to inspect
+the source code and build it yourself. Do not install releases from anywhere
+other than the official GitHub Releases page for this repository, or from a
+build you created yourself from source.
+
 Mega Win Alt Tab is a native Rust Windows switcher opened with `Ctrl+Alt+Space`.
 It shows switchable top-level windows, live DWM thumbnails, typed search, and
 Chrome tab-title results.
