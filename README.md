@@ -38,18 +38,18 @@ GitHub Releases page when clicked. It does not auto-download or install updates.
 | Key | What it does |
 | --- | --- |
 | `Ctrl+Alt+Space` | Open or hide the switcher overlay. |
-| Text input | Search window titles, Chrome tab titles, or app names in app mode. |
+| Text input | Search window titles, Chrome tab titles, app names, or favorite folders in app mode. |
 | `Backspace` | Delete the last character in the search text. |
 | `Up` | Move selection up. |
 | `Down` | Move selection down. |
 | `Tab` | Move selection down. |
-| `Enter` | Activate the selected window/tab, or launch the selected app in app mode, then close the overlay. |
+| `Enter` | Activate the selected window/tab, launch the selected app, or open the selected favorite folder, then close the overlay. |
 | `Esc` | Close the overlay without quitting the app. |
 | `Left` | Show the selected window/tab without moving keyboard focus away from the overlay; tap again to briefly highlight it. |
 | `Right` | Show the selected window/tab without moving keyboard focus away from the overlay; tap again to briefly highlight it. |
 | `Ctrl+F` | Maximize the selected window, or restore it if it is already maximized. |
 | `Ctrl+S` | Minimize the selected window. |
-| `Ctrl+W` | Close the selected window with the app's normal close behavior. |
+| `Ctrl+W` | Close the selected window, or remove the selected favorite folder in app mode. |
 | `Ctrl+Left` | Move the selected window/tab parent, or matching running app window, to the previous screen in the Windows layout order. |
 | `Ctrl+Right` | Move the selected window/tab parent, or matching running app window, to the next screen in the Windows layout order. |
 | `Ctrl+D` | Toggle all-desktops mode for windows and tabs. |
@@ -105,9 +105,17 @@ the tab result is shown and the duplicate browser-window result is hidden.
 
 While the overlay is open, press `Ctrl+?` (or `Ctrl+/`) to switch the current
 search into app launcher mode. The app scans current-user and all-users Start
-Menu shortcuts, Windows App Paths, and packaged Windows apps from the Start app
-catalog. It collapses duplicate app names and duplicate launch targets, then
-launches the selected app with Enter.
+Menu application shortcuts, Windows App Paths, Windows Start app catalog
+entries, and user-added favorite folders. Help files, documents, and website
+shortcuts in the Start Menu are skipped. It collapses duplicate app names and
+duplicate launch targets, then launches the selected app or opens the selected
+folder with Enter.
+
+To add a favorite folder, drag a folder onto the overlay. The app stores
+favorites in `%LOCALAPPDATA%\MegaWinAltTab\favorite-folders.json`, switches to
+app mode, and selects the dropped folder. Favorite folder results show the
+folder name and full path. In app mode, select a favorite folder and press
+`Ctrl+W` to remove it.
 
 ## All Desktops Mode
 

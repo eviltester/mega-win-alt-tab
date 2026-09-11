@@ -12,13 +12,17 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
-    HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, REG_VALUE_TYPE,
+    HKEY_LOCAL_MACHINE, KEY_READ, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
 };
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
-use windows::Win32::UI::Shell::{IShellLinkW, ShellExecuteW, ShellLink};
+use windows::Win32::UI::Shell::{
+    ApplicationActivationManager, IApplicationActivationManager, IShellLinkW, ShellExecuteW,
+    ShellLink, AO_NONE,
+};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 const APP_PATHS_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\App Paths");
+const APP_USER_MODEL_ID_PREFIX: &str = "appusermodelid:";
 
 pub(super) fn enumerate_apps() -> Vec<AppEntry> {
     let mut apps = Vec::new();
@@ -29,7 +33,7 @@ pub(super) fn enumerate_apps() -> Vec<AppEntry> {
         collect_apps_from_app_paths(HKEY_CURRENT_USER, AppSource::UserAppPath, &mut apps);
         collect_apps_from_app_paths(HKEY_LOCAL_MACHINE, AppSource::MachineAppPath, &mut apps);
     }
-    collect_packaged_apps(&mut apps);
+    collect_start_apps(&mut apps);
     apps
 }
 
@@ -70,43 +74,63 @@ fn collect_apps_from_dir(root: &Path, source: AppSource, apps: &mut Vec<AppEntry
             continue;
         }
 
-        if !is_launchable_shortcut(&path) {
-            continue;
-        }
-
         let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some(launch_identity) = shortcut_app_launch_identity(&path) else {
             continue;
         };
 
         apps.push(AppEntry {
             name: name.to_string(),
             launch_path: path.to_string_lossy().to_string(),
-            launch_identity: shortcut_launch_identity(&path),
+            launch_identity,
             source,
         });
     }
 }
 
-fn is_launchable_shortcut(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("lnk")
-                || extension.eq_ignore_ascii_case("appref-ms")
-                || extension.eq_ignore_ascii_case("url")
-        })
-}
-
-fn shortcut_launch_identity(path: &Path) -> Option<String> {
-    let is_shell_link = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"));
-    if !is_shell_link {
+fn shortcut_app_launch_identity(path: &Path) -> Option<Option<String>> {
+    if !is_start_menu_app_shortcut_type(path) {
         return None;
     }
 
+    let extension = path.extension().and_then(|extension| extension.to_str())?;
+    if extension.eq_ignore_ascii_case("appref-ms") {
+        return Some(None);
+    }
+
     unsafe { shell_link_target(path) }
+        .filter(|target| is_executable_launch_target(target))
+        .map(Some)
+}
+
+fn is_start_menu_app_shortcut_type(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("lnk") || extension.eq_ignore_ascii_case("appref-ms")
+        })
+}
+
+fn is_executable_launch_target(target: &str) -> bool {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("shell:") {
+        return true;
+    }
+
+    Path::new(trimmed)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "exe" | "com" | "bat" | "cmd" | "ps1"
+            )
+        })
 }
 
 unsafe fn shell_link_target(path: &Path) -> Option<String> {
@@ -167,7 +191,7 @@ unsafe fn collect_apps_from_app_paths(root: HKEY, source: AppSource, apps: &mut 
             continue;
         }
 
-        if let Some(launch_path) = read_default_registry_string(app_key) {
+        if let Some(launch_path) = read_registry_string(app_key, None) {
             if !launch_path.trim().is_empty() {
                 apps.push(AppEntry {
                     name: app_name_from_app_path_key(&key_name),
@@ -214,31 +238,35 @@ unsafe fn enum_registry_subkey(key: HKEY, index: u32) -> Option<String> {
     }
 }
 
-unsafe fn read_default_registry_string(key: HKEY) -> Option<String> {
+unsafe fn read_registry_string(key: HKEY, value_name: Option<&str>) -> Option<String> {
+    let value_name_wide = value_name.map(to_wide_z);
+    let value_name = value_name_wide
+        .as_ref()
+        .map_or(PCWSTR::null(), |name| PCWSTR(name.as_ptr()));
     let mut value_type = REG_VALUE_TYPE::default();
     let mut byte_len = 0u32;
     let status = RegQueryValueExW(
         key,
-        PCWSTR::null(),
+        value_name,
         None,
         Some(&mut value_type),
         None,
         Some(&mut byte_len),
     );
-    if status != ERROR_SUCCESS || value_type != REG_SZ {
+    if status != ERROR_SUCCESS || !matches!(value_type, REG_SZ | REG_EXPAND_SZ) {
         return None;
     }
 
     let mut bytes = vec![0u8; byte_len as usize];
     let status = RegQueryValueExW(
         key,
-        PCWSTR::null(),
+        value_name,
         None,
         Some(&mut value_type),
         Some(bytes.as_mut_ptr()),
         Some(&mut byte_len),
     );
-    if status != ERROR_SUCCESS || value_type != REG_SZ {
+    if status != ERROR_SUCCESS || !matches!(value_type, REG_SZ | REG_EXPAND_SZ) {
         return None;
     }
 
@@ -299,15 +327,15 @@ struct StartAppEntry {
     app_id: String,
 }
 
-fn collect_packaged_apps(apps: &mut Vec<AppEntry>) {
+fn collect_start_apps(apps: &mut Vec<AppEntry>) {
     for entry in start_app_entries() {
         let name = entry.name.trim();
         let app_id = entry.app_id.trim();
-        if name.is_empty() || !is_packaged_app_id(app_id) {
+        if name.is_empty() || !is_start_app_launch_id(app_id) {
             continue;
         }
 
-        let launch_path = packaged_app_launch_path(app_id);
+        let launch_path = start_app_launch_path(name, app_id);
         apps.push(AppEntry {
             name: name.to_string(),
             launch_identity: Some(launch_path.clone()),
@@ -319,7 +347,7 @@ fn collect_packaged_apps(apps: &mut Vec<AppEntry>) {
 
 fn start_app_entries() -> Vec<StartAppEntry> {
     let script = r#"
-$apps = @(Get-StartApps | Where-Object { $_.AppID -like '*!*' } | Select-Object Name,AppID)
+$apps = @(Get-StartApps | Select-Object Name,AppID)
 ConvertTo-Json -InputObject $apps -Compress
 "#;
     let Ok(output) = Command::new("powershell")
@@ -352,25 +380,114 @@ fn parse_start_app_entries(json: &str) -> Vec<StartAppEntry> {
     serde_json::from_str::<Vec<StartAppEntry>>(json).unwrap_or_default()
 }
 
-fn is_packaged_app_id(app_id: &str) -> bool {
-    app_id.contains('!') && !app_id.starts_with('{')
+fn is_start_app_launch_id(app_id: &str) -> bool {
+    let app_id = app_id.trim();
+    if app_id.is_empty() {
+        return false;
+    }
+
+    if is_executable_launch_target(app_id) {
+        return true;
+    }
+
+    if app_id.contains("://") {
+        return true;
+    }
+
+    if app_id.starts_with('{')
+        || app_id.contains('\\')
+        || app_id.contains('/')
+        || app_id.starts_with("Microsoft.AutoGenerated.")
+    {
+        return false;
+    }
+
+    true
 }
 
-fn packaged_app_launch_path(app_id: &str) -> String {
-    format!("shell:AppsFolder\\{app_id}")
+fn start_app_launch_path(_name: &str, app_id: &str) -> String {
+    if is_absolute_executable_launch_target(app_id) || app_id.contains("://") {
+        return app_id.to_string();
+    }
+
+    app_user_model_launch_path(app_id)
+}
+
+fn app_user_model_launch_path(app_id: &str) -> String {
+    format!("{APP_USER_MODEL_ID_PREFIX}{app_id}")
+}
+
+fn app_user_model_id_from_launch_path(launch_path: &str) -> Option<&str> {
+    launch_path
+        .trim()
+        .strip_prefix(APP_USER_MODEL_ID_PREFIX)
+        .filter(|app_id| !app_id.trim().is_empty())
+}
+
+fn is_absolute_executable_launch_target(target: &str) -> bool {
+    let path = Path::new(target.trim());
+    path.is_absolute() && is_executable_launch_target(target)
 }
 
 pub(super) unsafe fn launch_app(hwnd: HWND, launch_path: &str) -> bool {
+    if let Some(app_id) = app_user_model_id_from_launch_path(launch_path) {
+        return activate_app_user_model_id(app_id) || launch_shell_apps_folder_app_id(hwnd, app_id);
+    }
+
     let file = to_wide_z(launch_path);
+    let directory = launch_working_directory(launch_path);
+    let directory_wide = directory.as_deref().map(to_wide_z);
+    let directory = directory_wide
+        .as_ref()
+        .map_or(PCWSTR::null(), |path| PCWSTR(path.as_ptr()));
     let result = ShellExecuteW(
         hwnd,
         w!("open"),
         PCWSTR(file.as_ptr()),
         PCWSTR::null(),
+        directory,
+        SW_SHOWNORMAL,
+    );
+    result.0 as isize > 32
+}
+
+unsafe fn launch_shell_apps_folder_app_id(hwnd: HWND, app_id: &str) -> bool {
+    let file = to_wide_z("explorer.exe");
+    let parameters = to_wide_z(&format!("shell:AppsFolder\\{}", app_id.trim()));
+    let result = ShellExecuteW(
+        hwnd,
+        w!("open"),
+        PCWSTR(file.as_ptr()),
+        PCWSTR(parameters.as_ptr()),
         PCWSTR::null(),
         SW_SHOWNORMAL,
     );
     result.0 as isize > 32
+}
+
+unsafe fn activate_app_user_model_id(app_id: &str) -> bool {
+    let _apartment = ComApartment::initialize();
+    let activation_manager: IApplicationActivationManager =
+        match CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_INPROC_SERVER) {
+            Ok(manager) => manager,
+            Err(_) => return false,
+        };
+
+    let app_id = to_wide_z(app_id.trim());
+    activation_manager
+        .ActivateApplication(PCWSTR(app_id.as_ptr()), PCWSTR::null(), AO_NONE)
+        .is_ok()
+}
+
+fn launch_working_directory(launch_path: &str) -> Option<String> {
+    let path = Path::new(launch_path.trim());
+    if !path.is_absolute() || !is_executable_launch_target(launch_path) {
+        return None;
+    }
+
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.to_string_lossy().to_string())
 }
 
 fn to_wide_z(value: &str) -> Vec<u16> {
@@ -401,13 +518,36 @@ mod tests {
     }
 
     #[test]
-    fn launchable_shortcut_filter_accepts_start_menu_file_types() {
-        assert!(is_launchable_shortcut(Path::new("Signal.lnk")));
-        assert!(is_launchable_shortcut(Path::new("ClickOnce.APPREF-MS")));
-        assert!(is_launchable_shortcut(Path::new("Website.URL")));
-        assert!(!is_launchable_shortcut(Path::new("Signal.exe")));
-        assert!(!is_launchable_shortcut(Path::new("notes.txt")));
-        assert!(!is_launchable_shortcut(Path::new("Signal")));
+    fn shortcut_type_filter_accepts_app_shortcut_file_types() {
+        assert!(is_start_menu_app_shortcut_type(Path::new("Signal.lnk")));
+        assert!(is_start_menu_app_shortcut_type(Path::new(
+            "ClickOnce.APPREF-MS"
+        )));
+        assert!(!is_start_menu_app_shortcut_type(Path::new("Website.URL")));
+        assert!(!is_start_menu_app_shortcut_type(Path::new("Signal.exe")));
+        assert!(!is_start_menu_app_shortcut_type(Path::new("notes.txt")));
+        assert!(!is_start_menu_app_shortcut_type(Path::new("Signal")));
+    }
+
+    #[test]
+    fn executable_target_filter_rejects_help_and_document_targets() {
+        assert!(is_executable_launch_target(
+            r"C:\Program Files\Signal\Signal.exe"
+        ));
+        assert!(is_executable_launch_target(r"C:\Tools\launcher.cmd"));
+        assert!(is_executable_launch_target(
+            r"shell:AppsFolder\Example.App!App"
+        ));
+        assert!(!is_executable_launch_target(
+            r"C:\Program Files\7-Zip\7-zip.chm"
+        ));
+        assert!(!is_executable_launch_target(
+            r"C:\Program Files\App\readme.txt"
+        ));
+        assert!(!is_executable_launch_target(
+            r"C:\Program Files\App\manual.pdf"
+        ));
+        assert!(!is_executable_launch_target(" "));
     }
 
     #[test]
@@ -415,8 +555,9 @@ mod tests {
         let root = test_dir("shortcuts");
         let nested = root.join("Utilities");
         fs::create_dir_all(&nested).expect("nested test directory should be created");
-        fs::write(root.join("Signal.lnk"), b"").expect("shortcut should be written");
-        fs::write(nested.join("Nested App.url"), b"").expect("url shortcut should be written");
+        fs::write(root.join("Signal.appref-ms"), b"").expect("shortcut should be written");
+        fs::write(nested.join("Nested App.appref-ms"), b"").expect("shortcut should be written");
+        fs::write(nested.join("Website.url"), b"").expect("url shortcut should be written");
         fs::write(root.join("notes.txt"), b"").expect("ignored file should be written");
 
         let mut apps = Vec::new();
@@ -452,17 +593,72 @@ mod tests {
     }
 
     #[test]
-    fn packaged_app_ids_launch_through_apps_folder() {
-        let app_id = "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App";
+    fn start_app_ids_launch_through_app_user_model_activation() {
+        let packaged_app_id = "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App";
+        let docker_app_id = "Docker.DockerForWindows.Settings";
 
-        assert!(is_packaged_app_id(app_id));
+        assert!(is_start_app_launch_id(packaged_app_id));
+        assert!(is_start_app_launch_id(docker_app_id));
+        assert!(is_start_app_launch_id(
+            r"C:\Program Files\Docker\Docker\Docker Desktop.exe"
+        ));
+        assert!(is_start_app_launch_id("steam://rungameid/400020"));
         assert_eq!(
-            packaged_app_launch_path(app_id),
-            r"shell:AppsFolder\5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"
+            start_app_launch_path("WhatsApp", packaged_app_id),
+            "appusermodelid:5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"
         );
-        assert!(!is_packaged_app_id(
+        assert_eq!(
+            start_app_launch_path("Docker Desktop", docker_app_id),
+            "appusermodelid:Docker.DockerForWindows.Settings"
+        );
+        assert_eq!(
+            start_app_launch_path("Steam Game", "steam://rungameid/400020"),
+            "steam://rungameid/400020"
+        );
+        assert_eq!(
+            start_app_launch_path(
+                "Docker Desktop",
+                r"C:\Program Files\Docker\Docker\Docker Desktop.exe"
+            ),
+            r"C:\Program Files\Docker\Docker\Docker Desktop.exe"
+        );
+        assert!(!is_start_app_launch_id(
             r"{6D809377-6AF0-444B-8957-A3773F02200E}\IrfanView\i_changes.txt"
         ));
+        assert!(!is_start_app_launch_id(
+            r"{6D809377-6AF0-444B-8957-A3773F02200E}\7-Zip\7-zip.chm"
+        ));
+        assert!(!is_start_app_launch_id(
+            "Microsoft.AutoGenerated.{8ABD94FB-E7D6-84A6-A997-C918EDDE0AE5}"
+        ));
+    }
+
+    #[test]
+    fn app_user_model_launch_path_round_trips_internal_prefix() {
+        let launch_path = app_user_model_launch_path("Docker.DockerForWindows.Settings");
+
+        assert_eq!(
+            app_user_model_id_from_launch_path(&launch_path),
+            Some("Docker.DockerForWindows.Settings")
+        );
+        assert_eq!(app_user_model_id_from_launch_path(""), None);
+        assert_eq!(
+            app_user_model_id_from_launch_path("C:\\Tools\\App.exe"),
+            None
+        );
+    }
+
+    #[test]
+    fn executable_launches_use_parent_working_directory() {
+        assert_eq!(
+            launch_working_directory(r"C:\Program Files\Docker\Docker\Docker Desktop.exe"),
+            Some(r"C:\Program Files\Docker\Docker".to_string())
+        );
+        assert_eq!(
+            launch_working_directory("shell:AppsFolder\\Example.App!App"),
+            None
+        );
+        assert_eq!(launch_working_directory("steam://rungameid/400020"), None);
     }
 
     #[test]

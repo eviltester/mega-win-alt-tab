@@ -59,6 +59,26 @@ pub struct AppEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FavoriteFolderEntry {
+    pub name: String,
+    pub path: String,
+    pub normalized_path: String,
+}
+
+pub fn display_folder_path(path: &str) -> String {
+    let path = path.trim();
+    let lower = path.to_ascii_lowercase();
+    if lower.starts_with("\\\\?\\unc\\") {
+        return format!("\\\\{}", &path["\\\\?\\UNC\\".len()..]);
+    }
+    if lower.starts_with("\\\\?\\") {
+        return path["\\\\?\\".len()..].to_string();
+    }
+
+    path.to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionTabPayload {
     pub browser: String,
     #[serde(rename = "windowId")]
@@ -92,6 +112,7 @@ pub enum SearchResultKind {
     Window,
     Tab,
     App,
+    Folder,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +129,9 @@ pub enum ActivationTarget {
     },
     App {
         launch_path: String,
+    },
+    Folder {
+        path: String,
     },
 }
 
@@ -350,8 +374,85 @@ pub fn build_app_results(query: &str, apps: &[AppEntry]) -> Vec<SearchResult> {
         b.rank
             .cmp(&a.rank)
             .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+            .then_with(|| a.subtitle.to_lowercase().cmp(&b.subtitle.to_lowercase()))
     });
     results
+}
+
+pub fn build_launcher_results(
+    query: &str,
+    apps: &[AppEntry],
+    folders: &[FavoriteFolderEntry],
+) -> Vec<SearchResult> {
+    let mut results = build_app_results(query, apps);
+    results.extend(build_folder_results(query, folders));
+    results.sort_by(|a, b| {
+        b.rank
+            .cmp(&a.rank)
+            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+    });
+    results
+}
+
+pub fn build_folder_results(query: &str, folders: &[FavoriteFolderEntry]) -> Vec<SearchResult> {
+    let query = query.trim();
+    let folders = dedupe_favorite_folders(folders);
+    let mut results = Vec::new();
+
+    for (index, folder) in folders.iter().enumerate() {
+        let display_path = display_folder_path(&folder.path);
+        let score = if query.is_empty() {
+            4_500 - index as i32
+        } else if let Some(score) = match_score(query, &folder.name) {
+            score + 3_000
+        } else if let Some(score) =
+            match_score(query, &display_path).or_else(|| match_score(query, &folder.path))
+        {
+            score + 2_500
+        } else {
+            continue;
+        };
+
+        results.push(SearchResult {
+            kind: SearchResultKind::Folder,
+            title: folder.name.clone(),
+            subtitle: display_path,
+            screen_number: None,
+            rank: score,
+            target: ActivationTarget::Folder {
+                path: folder.path.clone(),
+            },
+        });
+    }
+
+    results.sort_by(|a, b| {
+        b.rank
+            .cmp(&a.rank)
+            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+            .then_with(|| a.subtitle.to_lowercase().cmp(&b.subtitle.to_lowercase()))
+    });
+    results
+}
+
+pub fn dedupe_favorite_folders(folders: &[FavoriteFolderEntry]) -> Vec<FavoriteFolderEntry> {
+    let mut folders_by_path: HashMap<String, FavoriteFolderEntry> = HashMap::new();
+    for folder in folders {
+        let key = folder.normalized_path.trim();
+        if key.is_empty() || folder.path.trim().is_empty() || folder.name.trim().is_empty() {
+            continue;
+        }
+        folders_by_path
+            .entry(key.to_string())
+            .or_insert_with(|| folder.clone());
+    }
+
+    let mut folders = folders_by_path.into_values().collect::<Vec<_>>();
+    folders.sort_by(|a, b| {
+        normalize_for_match(&a.name)
+            .cmp(&normalize_for_match(&b.name))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    folders
 }
 
 pub fn dedupe_apps(apps: &[AppEntry]) -> Vec<AppEntry> {
@@ -536,6 +637,7 @@ fn result_kind_order(kind: &SearchResultKind) -> i32 {
         SearchResultKind::Window => 0,
         SearchResultKind::Tab => 1,
         SearchResultKind::App => 2,
+        SearchResultKind::Folder => 3,
     }
 }
 
@@ -610,6 +712,14 @@ mod tests {
             launch_path: launch_path.to_string(),
             launch_identity: Some(launch_identity.to_string()),
             source,
+        }
+    }
+
+    fn folder(name: &str, path: &str) -> FavoriteFolderEntry {
+        FavoriteFolderEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            normalized_path: path.replace('/', "\\").to_lowercase(),
         }
     }
 
@@ -771,6 +881,92 @@ mod tests {
         assert!(results
             .iter()
             .all(|result| result.kind == SearchResultKind::App));
+    }
+
+    #[test]
+    fn favorite_folder_dedupe_collapses_normalized_paths() {
+        let folders = vec![
+            folder("Downloads", r"C:\Users\Example\Downloads"),
+            folder("downloads duplicate", "c:/users/example/downloads"),
+        ];
+
+        let deduped = dedupe_favorite_folders(&folders);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].name, "Downloads");
+    }
+
+    #[test]
+    fn display_folder_path_strips_windows_verbatim_prefixes() {
+        assert_eq!(
+            display_folder_path(r"\\?\C:\Users\Example\Downloads"),
+            r"C:\Users\Example\Downloads"
+        );
+        assert_eq!(
+            display_folder_path(r"\\?\UNC\server\share\Reports"),
+            r"\\server\share\Reports"
+        );
+        assert_eq!(
+            display_folder_path(r"C:\Users\Example\Downloads"),
+            r"C:\Users\Example\Downloads"
+        );
+    }
+
+    #[test]
+    fn folder_results_match_name_and_path_segments() {
+        let folders = vec![folder(
+            "Work Notes",
+            r"\\?\C:\Users\Example\Documents\Projects",
+        )];
+
+        let by_name = build_folder_results("work", &folders);
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].kind, SearchResultKind::Folder);
+        assert_eq!(by_name[0].subtitle, r"C:\Users\Example\Documents\Projects");
+
+        let by_path = build_folder_results("projects", &folders);
+        assert_eq!(by_path.len(), 1);
+        assert_eq!(by_path[0].title, "Work Notes");
+        assert!(matches!(by_path[0].target, ActivationTarget::Folder { .. }));
+    }
+
+    #[test]
+    fn folder_results_show_paths_for_same_named_folders() {
+        let folders = vec![
+            folder("Reports", r"C:\Users\Example\Work\Reports"),
+            folder("Reports", r"D:\Archive\Reports"),
+        ];
+
+        let results = build_folder_results("reports", &folders);
+        let subtitles = results
+            .iter()
+            .map(|result| result.subtitle.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            subtitles,
+            vec![r"C:\Users\Example\Work\Reports", r"D:\Archive\Reports"]
+        );
+    }
+
+    #[test]
+    fn launcher_results_include_matching_apps_and_folders() {
+        let apps = vec![app(
+            "Signal",
+            r"C:\Users\Example\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Signal.lnk",
+            AppSource::UserStartMenu,
+        )];
+        let folders = vec![folder("Signal Assets", r"C:\Users\Example\Signal Assets")];
+
+        let results = build_launcher_results("signal", &apps, &folders);
+
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .any(|result| result.kind == SearchResultKind::App));
+        assert!(results
+            .iter()
+            .any(|result| result.kind == SearchResultKind::Folder));
     }
 
     #[test]

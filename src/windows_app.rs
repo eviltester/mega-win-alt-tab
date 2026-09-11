@@ -1,9 +1,11 @@
 use mega_win_alt_tab::core::{
-    build_app_results, build_results_with_options, normalize_for_match, ActivationTarget, AppEntry,
-    BuildResultOptions, SearchResult, SearchResultKind, TabEntry, TabSource, WindowEntry,
+    build_launcher_results, build_results_with_options, normalize_for_match, ActivationTarget,
+    AppEntry, BuildResultOptions, FavoriteFolderEntry, SearchResult, SearchResultKind, TabEntry,
+    TabSource, WindowEntry,
 };
 use mega_win_alt_tab::extension_bridge::ExtensionBridge;
 mod apps;
+mod folders;
 mod icons;
 mod input;
 mod monitors;
@@ -13,6 +15,10 @@ mod updates;
 mod virtual_desktops;
 
 use apps::{enumerate_apps, launch_app};
+use folders::{
+    add_favorite_folder_path, dropped_file_paths, load_favorite_folders, normalize_folder_path,
+    open_folder, remove_favorite_folder_path, save_favorite_folders,
+};
 use icons::create_mega_icon;
 use input::{mouse_point, point_in_rect};
 use monitors::{
@@ -79,7 +85,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_NOREPEAT, TME_LEAVE, TRACKMOUSEEVENT, VK_BACK, VK_CONTROL, VK_D, VK_DOWN, VK_ESCAPE,
     VK_LEFT, VK_OEM_2, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
 };
-use windows::Win32::UI::Shell::{IVirtualDesktopManager, ShellExecuteW};
+use windows::Win32::UI::Shell::{DragAcceptFiles, IVirtualDesktopManager, ShellExecuteW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, DrawIconEx,
     EnumWindows, GetClassNameW, GetClientRect, GetMessageW, GetShellWindow, GetSystemMetrics,
@@ -91,9 +97,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ICON_SMALL, IDC_ARROW, IDI_APPLICATION, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MSG,
     SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-    WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETICON, WM_TIMER,
-    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DROPFILES, WM_HOTKEY, WM_KEYDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETICON,
+    WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_POPUP,
 };
 
 const HOTKEY_ID: i32 = 0x4d57;
@@ -125,7 +132,7 @@ const HELP_LINES: [&str; 12] = [
     "Left / Right - show without focus; second tap highlights",
     "Ctrl + F - maximize or restore selected window",
     "Ctrl + S - minimize selected window",
-    "Ctrl + W - close selected window",
+    "Ctrl + W - close selected window or remove favorite folder",
     "Ctrl + Left - move selected window to previous screen in layout",
     "Ctrl + Right - move selected window to next screen in layout",
     "Ctrl + D - search all desktops",
@@ -203,6 +210,7 @@ pub fn run() -> Result<()> {
             instance,
             Some(raw_state as *const c_void),
         )?;
+        DragAcceptFiles(hwnd, true);
         let _ = SendMessageW(
             hwnd,
             WM_SETICON,
@@ -256,6 +264,7 @@ struct AppState {
     help_rect: RECT,
     close_rect: RECT,
     apps: Vec<AppEntry>,
+    favorite_folders: Vec<FavoriteFolderEntry>,
     app_scan_completed: bool,
     app_scan_rx: Option<Receiver<Vec<AppEntry>>>,
     scan_apps_after_paint: bool,
@@ -315,6 +324,7 @@ impl AppState {
             help_rect: RECT::default(),
             close_rect: RECT::default(),
             apps: Vec::new(),
+            favorite_folders: load_favorite_folders(),
             app_scan_completed: false,
             app_scan_rx: None,
             scan_apps_after_paint: false,
@@ -554,7 +564,9 @@ impl AppState {
                     show_desktop_labels: self.all_desktops,
                 },
             ),
-            OverlayMode::Apps => build_app_results(&self.query, &self.apps),
+            OverlayMode::Apps => {
+                build_launcher_results(&self.query, &self.apps, &self.favorite_folders)
+            }
         };
         if self.results.is_empty() {
             self.selected = 0;
@@ -676,8 +688,10 @@ impl AppState {
             (OverlayMode::WindowsAndTabs, true) => {
                 "No matching windows or Chrome tabs on any desktop"
             }
-            (OverlayMode::Apps, _) if self.app_scan_rx.is_some() => "Scanning installed apps...",
-            (OverlayMode::Apps, _) => "No matching installed apps",
+            (OverlayMode::Apps, _) if self.app_scan_rx.is_some() => {
+                "Scanning installed apps and favorite folders..."
+            }
+            (OverlayMode::Apps, _) => "No matching installed apps or favorite folders",
         }
     }
 
@@ -750,6 +764,17 @@ impl AppState {
     }
 
     unsafe fn selected_close_window(&mut self) -> DeferredAction {
+        if let Some(path) =
+            selected_folder_removal_target(self.mode, self.results.get(self.selected))
+        {
+            if remove_favorite_folder_path(&mut self.favorite_folders, &path) {
+                let _ = save_favorite_folders(&self.favorite_folders);
+                self.rebuild_results();
+                let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+            }
+            return DeferredAction::None;
+        }
+
         let Some(result) = self.results.get(self.selected).cloned() else {
             return DeferredAction::None;
         };
@@ -778,18 +803,27 @@ impl AppState {
 
     unsafe fn poll_pending_close_windows(&mut self) {
         let mut closed_window_removed = false;
+        let self_hwnd = self.hwnd;
+        let include_all_desktops = self.all_desktops;
+        let virtual_desktop_manager = virtual_desktop_manager();
         self.pending_close_windows.retain(|hwnd, attempts| {
-            if !IsWindow(hwnd_from_isize(*hwnd)).as_bool() {
-                closed_window_removed = true;
-                return false;
+            let still_listable = pending_close_window_still_listable(
+                hwnd_from_isize(*hwnd),
+                self_hwnd,
+                include_all_desktops,
+                virtual_desktop_manager.as_ref(),
+            );
+            match pending_close_poll_decision(still_listable, *attempts) {
+                PendingClosePollDecision::Keep(next_attempts) => {
+                    *attempts = next_attempts;
+                    true
+                }
+                PendingClosePollDecision::RemoveAndRefresh => {
+                    closed_window_removed = true;
+                    false
+                }
+                PendingClosePollDecision::RemoveQuietly => false,
             }
-
-            if *attempts == 0 {
-                return false;
-            }
-
-            *attempts -= 1;
-            true
         });
 
         if self.pending_close_windows.is_empty() {
@@ -1076,7 +1110,9 @@ impl AppState {
             (OverlayMode::WindowsAndTabs, true, false) => {
                 format!("All desktops: {}", self.query)
             }
-            (OverlayMode::Apps, _, true) => "Type to search installed apps".to_string(),
+            (OverlayMode::Apps, _, true) => {
+                "Type to search installed apps and favorite folders".to_string()
+            }
             (OverlayMode::Apps, _, false) => format!("Apps: {}", self.query),
         };
         draw_text(
@@ -1237,14 +1273,23 @@ impl AppState {
                 SearchResultKind::Window => "Window",
                 SearchResultKind::Tab => "Chrome tab",
                 SearchResultKind::App => "Application",
+                SearchResultKind::Folder => "Favorite folder",
             };
 
-            if result.kind == SearchResultKind::App {
+            if matches!(
+                result.kind,
+                SearchResultKind::App | SearchResultKind::Folder
+            ) {
                 let old_app = SelectObject(hdc, screen_font);
                 SetTextColor(hdc, rgb(188, 194, 200));
+                let placeholder = if result.kind == SearchResultKind::Folder {
+                    "FOLDER"
+                } else {
+                    "APP"
+                };
                 draw_text(
                     hdc,
-                    "APP",
+                    placeholder,
                     thumb,
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                 );
@@ -1477,6 +1522,47 @@ impl AppState {
         }
     }
 
+    unsafe fn on_drop_files(&mut self, hdrop: HDROP) {
+        let mut first_valid_folder = None;
+        let mut changed = false;
+        for path in dropped_file_paths(hdrop) {
+            if let Some(result) = add_favorite_folder_path(&mut self.favorite_folders, &path) {
+                changed |= result.added;
+                if first_valid_folder.is_none() {
+                    first_valid_folder = Some(result.entry);
+                }
+            }
+        }
+
+        let Some(folder) = first_valid_folder else {
+            return;
+        };
+
+        if changed {
+            let _ = save_favorite_folders(&self.favorite_folders);
+        }
+        self.mode = OverlayMode::Apps;
+        self.query = folder.name.clone();
+        self.selected = 0;
+        self.start_app_scan_if_needed();
+        self.unregister_thumbnails();
+        self.rebuild_results();
+        self.select_folder_result(&folder.path);
+        let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+    }
+
+    fn select_folder_result(&mut self, path: &str) {
+        let normalized = normalize_folder_path(path);
+        self.selected = self
+            .results
+            .iter()
+            .position(|result| match &result.target {
+                ActivationTarget::Folder { path } => normalize_folder_path(path) == normalized,
+                _ => false,
+            })
+            .unwrap_or(0);
+    }
+
     unsafe fn on_mouse_leave(&mut self) {
         self.mouse_tracking = false;
         if self.help_hovered || self.close_hovered || self.update_link_hovered {
@@ -1495,6 +1581,7 @@ impl Drop for AppState {
             self.unregister_thumbnails();
             self.destroy_highlight_windows();
             if !self.hwnd.0.is_null() {
+                DragAcceptFiles(self.hwnd, false);
                 let _ = UnregisterHotKey(self.hwnd, HOTKEY_ID);
             }
             if self.owns_app_icon {
@@ -1699,6 +1786,12 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
             let (x, y) = mouse_point(lparam);
             with_state_mut(state_ptr, "handle left click", (), |state| {
                 state.on_left_button_up(x, y)
+            });
+            return LRESULT(0);
+        }
+        WM_DROPFILES => {
+            with_state_mut(state_ptr, "handle dropped files", (), |state| {
+                state.on_drop_files(HDROP(wparam.0 as *mut c_void))
             });
             return LRESULT(0);
         }
@@ -1978,6 +2071,49 @@ unsafe fn is_cloaked(hwnd: HWND) -> bool {
     )
     .is_ok()
         && cloaked != 0
+}
+
+unsafe fn pending_close_window_still_listable(
+    hwnd: HWND,
+    self_hwnd: HWND,
+    include_all_desktops: bool,
+    virtual_desktop_manager: Option<&IVirtualDesktopManager>,
+) -> bool {
+    if hwnd == self_hwnd || !IsWindow(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+        return false;
+    }
+    if is_tool_window(hwnd) {
+        return false;
+    }
+
+    let desktop_location = window_desktop_location(virtual_desktop_manager, hwnd);
+    let cloaked = is_cloaked(hwnd);
+    if !should_include_window_for_desktop(include_all_desktops, desktop_location, cloaked) {
+        return false;
+    }
+
+    !get_window_text(hwnd).trim().is_empty()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingClosePollDecision {
+    Keep(u8),
+    RemoveAndRefresh,
+    RemoveQuietly,
+}
+
+fn pending_close_poll_decision(
+    window_still_listable: bool,
+    attempts_remaining: u8,
+) -> PendingClosePollDecision {
+    if !window_still_listable {
+        return PendingClosePollDecision::RemoveAndRefresh;
+    }
+    if attempts_remaining == 0 {
+        return PendingClosePollDecision::RemoveQuietly;
+    }
+
+    PendingClosePollDecision::Keep(attempts_remaining - 1)
 }
 
 unsafe fn highlight_rect_for_window(hwnd: HWND) -> Option<RECT> {
@@ -2396,6 +2532,9 @@ unsafe fn run_activation(request: ActivationRequest) -> Option<isize> {
         ActivationTarget::App { ref launch_path } => {
             let _ = launch_app(request.overlay_hwnd, launch_path);
         }
+        ActivationTarget::Folder { ref path } => {
+            let _ = open_folder(request.overlay_hwnd, path);
+        }
     }
 
     if request.restore_overlay_focus {
@@ -2491,6 +2630,21 @@ fn selected_move_target_hwnd(result: &SearchResult, windows: &[WindowEntry]) -> 
         ActivationTarget::Window { hwnd } => Some(*hwnd),
         ActivationTarget::Tab { parent_hwnd, .. } => *parent_hwnd,
         ActivationTarget::App { .. } => running_window_for_app(&result.title, windows),
+        ActivationTarget::Folder { .. } => None,
+    }
+}
+
+fn selected_folder_removal_target(
+    mode: OverlayMode,
+    result: Option<&SearchResult>,
+) -> Option<String> {
+    if mode != OverlayMode::Apps {
+        return None;
+    }
+
+    match result.map(|result| &result.target) {
+        Some(ActivationTarget::Folder { path }) => Some(path.clone()),
+        _ => None,
     }
 }
 
@@ -2569,7 +2723,7 @@ fn result_thumbnail_hwnd(result: &SearchResult) -> Option<isize> {
     match &result.target {
         ActivationTarget::Window { hwnd } => Some(*hwnd),
         ActivationTarget::Tab { parent_hwnd, .. } => *parent_hwnd,
-        ActivationTarget::App { .. } => None,
+        ActivationTarget::App { .. } | ActivationTarget::Folder { .. } => None,
     }
 }
 
@@ -2850,6 +3004,12 @@ mod tests {
             })),
             None
         );
+        assert_eq!(
+            result_thumbnail_hwnd(&result_with_target(ActivationTarget::Folder {
+                path: "C:\\Users\\Example\\Downloads".to_string(),
+            })),
+            None
+        );
     }
 
     #[test]
@@ -2902,6 +3062,26 @@ mod tests {
     }
 
     #[test]
+    fn selected_folder_removal_target_only_applies_in_app_mode() {
+        let result = result_with_target(ActivationTarget::Folder {
+            path: "C:\\Users\\Example\\Downloads".to_string(),
+        });
+
+        assert_eq!(
+            selected_folder_removal_target(OverlayMode::Apps, Some(&result)),
+            Some("C:\\Users\\Example\\Downloads".to_string())
+        );
+        assert_eq!(
+            selected_folder_removal_target(OverlayMode::WindowsAndTabs, Some(&result)),
+            None
+        );
+        assert_eq!(
+            selected_folder_removal_target(OverlayMode::Apps, None),
+            None
+        );
+    }
+
+    #[test]
     fn repeated_peek_highlights_same_target_within_short_window() {
         let first_tap = Instant::now();
         let second_tap = first_tap + Duration::from_millis(HIGHLIGHT_SECOND_TAP_MS - 1);
@@ -2931,6 +3111,26 @@ mod tests {
             Some(42),
             second_tap
         ));
+    }
+
+    #[test]
+    fn pending_close_poll_refreshes_when_window_is_no_longer_listable() {
+        assert_eq!(
+            pending_close_poll_decision(false, CLOSE_REFRESH_ATTEMPTS),
+            PendingClosePollDecision::RemoveAndRefresh
+        );
+    }
+
+    #[test]
+    fn pending_close_poll_keeps_visible_window_until_attempts_expire() {
+        assert_eq!(
+            pending_close_poll_decision(true, 2),
+            PendingClosePollDecision::Keep(1)
+        );
+        assert_eq!(
+            pending_close_poll_decision(true, 0),
+            PendingClosePollDecision::RemoveQuietly
+        );
     }
 
     #[test]
