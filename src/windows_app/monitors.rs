@@ -29,6 +29,13 @@ pub(super) unsafe fn enumerate_monitor_numbers() -> HashMap<isize, u32> {
         .collect()
 }
 
+pub(super) unsafe fn enumerate_monitor_screen_numbers() -> Vec<u32> {
+    enumerate_monitor_entries()
+        .into_iter()
+        .map(|monitor| monitor.number)
+        .collect()
+}
+
 unsafe fn enumerate_monitor_entries() -> Vec<MonitorEntry> {
     unsafe extern "system" fn callback(
         monitor: HMONITOR,
@@ -152,12 +159,56 @@ pub(super) unsafe fn move_window_to_monitor(
     let next_index = monitor_index_after_move(current_index, monitors.len(), direction);
     let next = monitors[next_index];
 
+    move_window_between_monitors(hwnd, original_window_rect, current.rect, next.rect)
+}
+
+pub(super) unsafe fn move_window_to_screen_number(
+    hwnd: HWND,
+    original_window_rect: RECT,
+    screen_number: u32,
+) -> bool {
+    let monitors = enumerate_monitor_entries();
+    if monitors.len() < 2 {
+        return false;
+    }
+
+    let current_monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if current_monitor.is_invalid() {
+        return false;
+    }
+
+    let Some(current) = monitors
+        .iter()
+        .find(|monitor| monitor.handle == current_monitor.0 as isize)
+    else {
+        return false;
+    };
+    let Some(target) = monitors
+        .iter()
+        .find(|monitor| monitor.number == screen_number)
+    else {
+        return false;
+    };
+
+    move_window_between_monitors(hwnd, original_window_rect, current.rect, target.rect)
+}
+
+unsafe fn move_window_between_monitors(
+    hwnd: HWND,
+    original_window_rect: RECT,
+    current_monitor_rect: RECT,
+    target_monitor_rect: RECT,
+) -> bool {
     let Some(window_rect) = current_window_rect(hwnd) else {
         return false;
     };
 
-    let placement =
-        next_monitor_window_placement(window_rect, original_window_rect, current.rect, next.rect);
+    let placement = next_monitor_window_placement(
+        window_rect,
+        original_window_rect,
+        current_monitor_rect,
+        target_monitor_rect,
+    );
     SetWindowPos(
         hwnd,
         None,

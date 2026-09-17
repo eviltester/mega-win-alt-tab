@@ -22,8 +22,9 @@ use folders::{
 use icons::create_mega_icon;
 use input::{mouse_point, point_in_rect};
 use monitors::{
-    current_window_rect, enumerate_monitor_numbers, monitor_rect_for_window,
-    move_window_to_monitor, window_screen_number, MonitorMoveDirection,
+    current_window_rect, enumerate_monitor_numbers, enumerate_monitor_screen_numbers,
+    monitor_rect_for_window, move_window_to_monitor, move_window_to_screen_number,
+    window_screen_number, MonitorMoveDirection,
 };
 use startup::{
     is_run_at_startup_enabled, legacy_startup_entries, remove_startup_entries, set_run_at_startup,
@@ -54,7 +55,7 @@ use virtual_desktops::{
 };
 use windows::core::{w, Result, PCWSTR, PWSTR, VARIANT};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, COLORREF, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    CloseHandle, BOOL, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmRegisterThumbnail, DwmUnregisterThumbnail,
@@ -87,20 +88,22 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, IVirtualDesktopManager, ShellExecuteW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, DrawIconEx,
-    EnumWindows, GetClassNameW, GetClientRect, GetMessageW, GetShellWindow, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadIconW, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    DI_NORMAL, GWLP_USERDATA, GWL_EXSTYLE, HICON, HTTRANSPARENT, HWND_TOP, HWND_TOPMOST, ICON_BIG,
-    ICON_SMALL, IDC_ARROW, IDI_APPLICATION, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MSG,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, DispatchMessageW, DrawIconEx, EnumWindows, GetClassNameW, GetClientRect,
+    GetCursorPos, GetMessageW, GetShellWindow, GetSystemMetrics, GetWindowLongPtrW,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadIconW, MessageBoxW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, CS_DBLCLKS,
+    CS_HREDRAW, CS_VREDRAW, DI_NORMAL, GWLP_USERDATA, GWL_EXSTYLE, HICON, HMENU, HTTRANSPARENT,
+    HWND_TOP, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW, IDI_APPLICATION, IDYES, MB_DEFBUTTON2,
+    MB_ICONWARNING, MB_YESNO, MENU_ITEM_FLAGS, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
     SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-    WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DROPFILES, WM_HOTKEY, WM_KEYDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETICON,
-    WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    WS_POPUP,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DROPFILES,
+    WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST,
+    WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETICON, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 const HOTKEY_ID: i32 = 0x4d57;
@@ -124,6 +127,14 @@ const GITHUB_RELEASES_URL: PCWSTR = w!("https://github.com/eviltester/mega-win-a
 const KEY_F: u32 = b'F' as u32;
 const KEY_S: u32 = b'S' as u32;
 const KEY_W: u32 = b'W' as u32;
+const RESULT_CONTEXT_ACTIVATE_ID: usize = 2000;
+const RESULT_CONTEXT_PEEK_ID: usize = 2001;
+const RESULT_CONTEXT_TOGGLE_MAXIMIZE_ID: usize = 2002;
+const RESULT_CONTEXT_MINIMIZE_ID: usize = 2003;
+const RESULT_CONTEXT_CLOSE_ID: usize = 2004;
+const RESULT_CONTEXT_MOVE_PREVIOUS_ID: usize = 2005;
+const RESULT_CONTEXT_MOVE_NEXT_ID: usize = 2006;
+const RESULT_CONTEXT_MOVE_SCREEN_BASE_ID: usize = 2100;
 const HELP_LINES: [&str; 12] = [
     concat!("Version ", env!("CARGO_PKG_VERSION")),
     "Esc - close",
@@ -177,7 +188,7 @@ pub fn run() -> Result<()> {
             hIcon: icon,
             hInstance: instance.into(),
             lpszClassName: CLASS_NAME,
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wnd_proc),
             ..Default::default()
         };
@@ -290,6 +301,7 @@ struct AppState {
 #[derive(Clone, Copy)]
 struct RowLayout {
     index: usize,
+    row: RECT,
     thumbnail: RECT,
 }
 
@@ -303,6 +315,33 @@ struct ThumbnailSize {
 enum OverlayMode {
     WindowsAndTabs,
     Apps,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowMoveTarget {
+    Direction(MonitorMoveDirection),
+    ScreenNumber(u32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResultContextMenuRequest {
+    activate_label: String,
+    has_window_actions: bool,
+    close_label: Option<String>,
+    screen_numbers: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResultContextMenuCommand {
+    None,
+    Activate,
+    Peek,
+    ToggleMaximize,
+    Minimize,
+    Close,
+    MovePrevious,
+    MoveNext,
+    MoveToScreen(u32),
 }
 
 impl AppState {
@@ -840,6 +879,14 @@ impl AppState {
         &mut self,
         direction: MonitorMoveDirection,
     ) -> DeferredAction {
+        self.selected_move_to_target(WindowMoveTarget::Direction(direction))
+    }
+
+    unsafe fn selected_move_to_screen(&mut self, screen_number: u32) -> DeferredAction {
+        self.selected_move_to_target(WindowMoveTarget::ScreenNumber(screen_number))
+    }
+
+    unsafe fn selected_move_to_target(&mut self, target: WindowMoveTarget) -> DeferredAction {
         let Some(result) = self.results.get(self.selected).cloned() else {
             return DeferredAction::None;
         };
@@ -861,7 +908,7 @@ impl AppState {
             hwnd,
             overlay_hwnd: self.hwnd,
             original_rect,
-            direction,
+            target,
         }))
     }
 
@@ -1265,6 +1312,7 @@ impl AppState {
 
             self.row_layouts.push(RowLayout {
                 index,
+                row,
                 thumbnail: thumb,
             });
 
@@ -1519,6 +1567,95 @@ impl AppState {
         }
         if self.visible && point_in_rect(self.close_rect, x, y) {
             self.hide();
+            return;
+        }
+        if self.visible {
+            self.select_result_at(x, y);
+        }
+    }
+
+    unsafe fn on_left_button_double_click(&mut self, x: i32, y: i32) -> DeferredAction {
+        if !self.visible || self.splash_visible || !self.select_result_at(x, y) {
+            return DeferredAction::None;
+        }
+
+        let action = self.selected_activation(false);
+        self.hide();
+        action
+    }
+
+    unsafe fn select_result_at(&mut self, x: i32, y: i32) -> bool {
+        let Some(index) = result_row_at_point(&self.row_layouts, x, y) else {
+            return false;
+        };
+
+        if self.selected != index {
+            self.selected = index;
+            let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+        }
+        true
+    }
+
+    unsafe fn prepare_result_context_menu(
+        &mut self,
+        x: i32,
+        y: i32,
+    ) -> Option<ResultContextMenuRequest> {
+        if !self.visible || self.splash_visible || !self.select_result_at(x, y) {
+            return None;
+        }
+
+        self.selected_context_menu_request()
+    }
+
+    unsafe fn selected_context_menu_request(&self) -> Option<ResultContextMenuRequest> {
+        let result = self.results.get(self.selected)?;
+        let has_window_actions = selected_move_target_hwnd(result, &self.windows).is_some();
+        let screen_numbers = if has_window_actions {
+            enumerate_monitor_screen_numbers()
+        } else {
+            Vec::new()
+        };
+        let close_label = if selected_folder_removal_target(self.mode, Some(result)).is_some() {
+            Some("Remove favorite folder (Ctrl+W)".to_string())
+        } else if has_window_actions {
+            Some("Close window (Ctrl+W)".to_string())
+        } else {
+            None
+        };
+
+        Some(ResultContextMenuRequest {
+            activate_label: activate_context_label(&result.kind).to_string(),
+            has_window_actions,
+            close_label,
+            screen_numbers,
+        })
+    }
+
+    unsafe fn handle_result_context_menu_command(
+        &mut self,
+        command: ResultContextMenuCommand,
+    ) -> DeferredAction {
+        match command {
+            ResultContextMenuCommand::None => DeferredAction::None,
+            ResultContextMenuCommand::Activate => {
+                let action = self.selected_activation(false);
+                self.hide();
+                action
+            }
+            ResultContextMenuCommand::Peek => self.selected_peek_window(),
+            ResultContextMenuCommand::ToggleMaximize => self.selected_toggle_maximize(),
+            ResultContextMenuCommand::Minimize => self.selected_minimize_window(),
+            ResultContextMenuCommand::Close => self.selected_close_window(),
+            ResultContextMenuCommand::MovePrevious => {
+                self.selected_move_to_monitor(MonitorMoveDirection::Previous)
+            }
+            ResultContextMenuCommand::MoveNext => {
+                self.selected_move_to_monitor(MonitorMoveDirection::Next)
+            }
+            ResultContextMenuCommand::MoveToScreen(screen_number) => {
+                self.selected_move_to_screen(screen_number)
+            }
         }
     }
 
@@ -1614,7 +1751,7 @@ struct MoveWindowRequest {
     hwnd: isize,
     overlay_hwnd: HWND,
     original_rect: RECT,
-    direction: MonitorMoveDirection,
+    target: WindowMoveTarget,
 }
 
 struct PeekWindowRequest {
@@ -1789,14 +1926,99 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
             });
             return LRESULT(0);
         }
+        WM_LBUTTONDBLCLK => {
+            let (x, y) = mouse_point(lparam);
+            let action = with_state_mut(
+                state_ptr,
+                "handle double click",
+                DeferredAction::None,
+                |state| state.on_left_button_double_click(x, y),
+            );
+            let outcome = action.run();
+            if outcome.refresh {
+                with_state_mut(state_ptr, "refresh after deferred action", (), |state| {
+                    state.refresh()
+                });
+            }
+            if let Some(target) = outcome.highlight_target {
+                with_state_mut(state_ptr, "show attention border", (), |state| {
+                    state.show_attention_border(target)
+                });
+            }
+            return LRESULT(0);
+        }
         WM_DROPFILES => {
             with_state_mut(state_ptr, "handle dropped files", (), |state| {
                 state.on_drop_files(HDROP(wparam.0 as *mut c_void))
             });
             return LRESULT(0);
         }
-        WM_RBUTTONUP | WM_CONTEXTMENU => {
-            handle_tray_menu_command(hwnd);
+        WM_RBUTTONUP => {
+            let (x, y) = mouse_point(lparam);
+            let request = with_state_mut(state_ptr, "prepare result context menu", None, |state| {
+                state.prepare_result_context_menu(x, y)
+            });
+            let action = if let Some(request) = request {
+                let command = show_result_context_menu(hwnd, &request);
+                with_state_mut(
+                    state_ptr,
+                    "handle result context menu command",
+                    DeferredAction::None,
+                    |state| state.handle_result_context_menu_command(command),
+                )
+            } else {
+                handle_tray_menu_command(hwnd);
+                DeferredAction::None
+            };
+            let outcome = action.run();
+            if outcome.refresh {
+                with_state_mut(state_ptr, "refresh after deferred action", (), |state| {
+                    state.refresh()
+                });
+            }
+            if let Some(target) = outcome.highlight_target {
+                with_state_mut(state_ptr, "show attention border", (), |state| {
+                    state.show_attention_border(target)
+                });
+            }
+            return LRESULT(0);
+        }
+        WM_CONTEXTMENU => {
+            let request = with_state_mut(
+                state_ptr,
+                "prepare selected result context menu",
+                None,
+                |state| {
+                    if state.visible && !state.splash_visible {
+                        state.selected_context_menu_request()
+                    } else {
+                        None
+                    }
+                },
+            );
+            let action = if let Some(request) = request {
+                let command = show_result_context_menu(hwnd, &request);
+                with_state_mut(
+                    state_ptr,
+                    "handle selected result context menu command",
+                    DeferredAction::None,
+                    |state| state.handle_result_context_menu_command(command),
+                )
+            } else {
+                handle_tray_menu_command(hwnd);
+                DeferredAction::None
+            };
+            let outcome = action.run();
+            if outcome.refresh {
+                with_state_mut(state_ptr, "refresh after deferred action", (), |state| {
+                    state.refresh()
+                });
+            }
+            if let Some(target) = outcome.highlight_target {
+                with_state_mut(state_ptr, "show attention border", (), |state| {
+                    state.show_attention_border(target)
+                });
+            }
             return LRESULT(0);
         }
         WM_CHAR => {
@@ -1876,6 +2098,135 @@ unsafe fn handle_tray_menu_command(hwnd: HWND) {
         TrayMenuCommand::Exit => {
             let _ = DestroyWindow(hwnd);
         }
+    }
+}
+
+unsafe fn show_result_context_menu(
+    hwnd: HWND,
+    request: &ResultContextMenuRequest,
+) -> ResultContextMenuCommand {
+    let Ok(menu) = CreatePopupMenu() else {
+        return ResultContextMenuCommand::None;
+    };
+
+    append_menu_text(menu, RESULT_CONTEXT_ACTIVATE_ID, &request.activate_label);
+
+    if request.has_window_actions {
+        append_menu_separator(menu);
+        append_menu_text(
+            menu,
+            RESULT_CONTEXT_PEEK_ID,
+            "Show without focus (Left / Right)",
+        );
+        append_menu_text(
+            menu,
+            RESULT_CONTEXT_TOGGLE_MAXIMIZE_ID,
+            "Maximize or restore (Ctrl+F)",
+        );
+        append_menu_text(menu, RESULT_CONTEXT_MINIMIZE_ID, "Minimize (Ctrl+S)");
+    }
+
+    if request.has_window_actions && request.screen_numbers.len() > 1 {
+        if let Ok(move_menu) = CreatePopupMenu() {
+            append_menu_text(
+                move_menu,
+                RESULT_CONTEXT_MOVE_PREVIOUS_ID,
+                "To previous screen (Ctrl+Left)",
+            );
+            append_menu_text(
+                move_menu,
+                RESULT_CONTEXT_MOVE_NEXT_ID,
+                "To next screen (Ctrl+Right)",
+            );
+            append_menu_separator(move_menu);
+            for (index, screen_number) in request.screen_numbers.iter().enumerate() {
+                append_menu_text(
+                    move_menu,
+                    RESULT_CONTEXT_MOVE_SCREEN_BASE_ID + index,
+                    &format!("To screen {screen_number}"),
+                );
+            }
+            append_menu_separator(menu);
+            append_menu_popup(menu, move_menu, "Move");
+        }
+    }
+
+    if let Some(close_label) = &request.close_label {
+        append_menu_separator(menu);
+        append_menu_text(menu, RESULT_CONTEXT_CLOSE_ID, close_label);
+    }
+
+    let command_id = track_popup_menu_at_cursor(hwnd, menu);
+    let _ = DestroyMenu(menu);
+
+    result_context_menu_command_from_id(command_id, &request.screen_numbers)
+}
+
+unsafe fn append_menu_text(menu: HMENU, id: usize, text: &str) {
+    let text = to_wide_null(text);
+    let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(text.as_ptr()));
+}
+
+unsafe fn append_menu_separator(menu: HMENU) {
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+}
+
+unsafe fn append_menu_popup(menu: HMENU, submenu: HMENU, text: &str) {
+    let text = to_wide_null(text);
+    let _ = AppendMenuW(
+        menu,
+        MENU_ITEM_FLAGS(MF_POPUP.0 | MF_STRING.0),
+        submenu.0 as usize,
+        PCWSTR(text.as_ptr()),
+    );
+}
+
+unsafe fn track_popup_menu_at_cursor(hwnd: HWND, menu: HMENU) -> usize {
+    let mut point = POINT::default();
+    if GetCursorPos(&mut point).is_err() {
+        return 0;
+    }
+
+    let _ = SetForegroundWindow(hwnd);
+    let command = TrackPopupMenu(
+        menu,
+        TPM_RIGHTBUTTON | TPM_RETURNCMD,
+        point.x,
+        point.y,
+        0,
+        hwnd,
+        None,
+    );
+    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+    command.0 as usize
+}
+
+fn result_context_menu_command_from_id(
+    command_id: usize,
+    screen_numbers: &[u32],
+) -> ResultContextMenuCommand {
+    match command_id {
+        RESULT_CONTEXT_ACTIVATE_ID => ResultContextMenuCommand::Activate,
+        RESULT_CONTEXT_PEEK_ID => ResultContextMenuCommand::Peek,
+        RESULT_CONTEXT_TOGGLE_MAXIMIZE_ID => ResultContextMenuCommand::ToggleMaximize,
+        RESULT_CONTEXT_MINIMIZE_ID => ResultContextMenuCommand::Minimize,
+        RESULT_CONTEXT_CLOSE_ID => ResultContextMenuCommand::Close,
+        RESULT_CONTEXT_MOVE_PREVIOUS_ID => ResultContextMenuCommand::MovePrevious,
+        RESULT_CONTEXT_MOVE_NEXT_ID => ResultContextMenuCommand::MoveNext,
+        id if id >= RESULT_CONTEXT_MOVE_SCREEN_BASE_ID => screen_numbers
+            .get(id - RESULT_CONTEXT_MOVE_SCREEN_BASE_ID)
+            .copied()
+            .map(ResultContextMenuCommand::MoveToScreen)
+            .unwrap_or(ResultContextMenuCommand::None),
+        _ => ResultContextMenuCommand::None,
+    }
+}
+
+fn activate_context_label(kind: &SearchResultKind) -> &'static str {
+    match kind {
+        SearchResultKind::Window | SearchResultKind::Tab => "Activate (Enter)",
+        SearchResultKind::App => "Launch (Enter)",
+        SearchResultKind::Folder => "Open (Enter)",
     }
 }
 
@@ -2590,7 +2941,14 @@ unsafe fn run_move_to_monitor(request: MoveWindowRequest) -> bool {
 
     move_window_to_overlay_desktop_if_needed(hwnd, request.overlay_hwnd);
 
-    let moved = move_window_to_monitor(hwnd, request.original_rect, request.direction);
+    let moved = match request.target {
+        WindowMoveTarget::Direction(direction) => {
+            move_window_to_monitor(hwnd, request.original_rect, direction)
+        }
+        WindowMoveTarget::ScreenNumber(screen_number) => {
+            move_window_to_screen_number(hwnd, request.original_rect, screen_number)
+        }
+    };
     if moved {
         restore_overlay_focus(request.overlay_hwnd);
     }
@@ -2914,6 +3272,12 @@ fn selection_status_text(selected: usize, total: usize) -> String {
     }
 }
 
+fn result_row_at_point(row_layouts: &[RowLayout], x: i32, y: i32) -> Option<usize> {
+    row_layouts
+        .iter()
+        .find_map(|layout| point_in_rect(layout.row, x, y).then_some(layout.index))
+}
+
 fn result_number_label(index: usize) -> String {
     (index + 1).to_string()
 }
@@ -3078,6 +3442,87 @@ mod tests {
         assert_eq!(
             selected_folder_removal_target(OverlayMode::Apps, None),
             None
+        );
+    }
+
+    #[test]
+    fn result_row_hit_testing_selects_visible_row() {
+        let layouts = vec![
+            RowLayout {
+                index: 3,
+                row: RECT {
+                    left: 20,
+                    top: 100,
+                    right: 400,
+                    bottom: 170,
+                },
+                thumbnail: RECT::default(),
+            },
+            RowLayout {
+                index: 4,
+                row: RECT {
+                    left: 20,
+                    top: 176,
+                    right: 400,
+                    bottom: 246,
+                },
+                thumbnail: RECT::default(),
+            },
+        ];
+
+        assert_eq!(result_row_at_point(&layouts, 25, 120), Some(3));
+        assert_eq!(result_row_at_point(&layouts, 399, 245), Some(4));
+        assert_eq!(result_row_at_point(&layouts, 400, 245), None);
+        assert_eq!(result_row_at_point(&layouts, 25, 173), None);
+    }
+
+    #[test]
+    fn result_context_menu_command_maps_dynamic_screen_ids() {
+        let screens = vec![3, 1, 2, 4];
+
+        assert_eq!(
+            result_context_menu_command_from_id(RESULT_CONTEXT_ACTIVATE_ID, &screens),
+            ResultContextMenuCommand::Activate
+        );
+        assert_eq!(
+            result_context_menu_command_from_id(RESULT_CONTEXT_MOVE_PREVIOUS_ID, &screens),
+            ResultContextMenuCommand::MovePrevious
+        );
+        assert_eq!(
+            result_context_menu_command_from_id(RESULT_CONTEXT_MOVE_NEXT_ID, &screens),
+            ResultContextMenuCommand::MoveNext
+        );
+        assert_eq!(
+            result_context_menu_command_from_id(RESULT_CONTEXT_MOVE_SCREEN_BASE_ID, &screens),
+            ResultContextMenuCommand::MoveToScreen(3)
+        );
+        assert_eq!(
+            result_context_menu_command_from_id(RESULT_CONTEXT_MOVE_SCREEN_BASE_ID + 3, &screens),
+            ResultContextMenuCommand::MoveToScreen(4)
+        );
+        assert_eq!(
+            result_context_menu_command_from_id(RESULT_CONTEXT_MOVE_SCREEN_BASE_ID + 4, &screens),
+            ResultContextMenuCommand::None
+        );
+    }
+
+    #[test]
+    fn activate_context_label_matches_result_kind() {
+        assert_eq!(
+            activate_context_label(&SearchResultKind::Window),
+            "Activate (Enter)"
+        );
+        assert_eq!(
+            activate_context_label(&SearchResultKind::Tab),
+            "Activate (Enter)"
+        );
+        assert_eq!(
+            activate_context_label(&SearchResultKind::App),
+            "Launch (Enter)"
+        );
+        assert_eq!(
+            activate_context_label(&SearchResultKind::Folder),
+            "Open (Enter)"
         );
     }
 
