@@ -893,14 +893,23 @@ impl AppState {
         let Some(hwnd) = selected_move_target_hwnd(&result, &self.windows) else {
             return DeferredAction::None;
         };
-        let original_rect = match self.original_window_rects.get(&hwnd).copied() {
-            Some(rect) => rect,
-            None => {
-                let Some(rect) = current_window_rect(hwnd_from_isize(hwnd)) else {
-                    return DeferredAction::None;
-                };
-                self.original_window_rects.insert(hwnd, rect);
-                rect
+        let target_hwnd = hwnd_from_isize(hwnd);
+        let was_maximized = IsZoomed(target_hwnd).as_bool();
+        let original_rect = if was_maximized {
+            let Some(rect) = current_window_rect(target_hwnd) else {
+                return DeferredAction::None;
+            };
+            rect
+        } else {
+            match self.original_window_rects.get(&hwnd).copied() {
+                Some(rect) => rect,
+                None => {
+                    let Some(rect) = current_window_rect(target_hwnd) else {
+                        return DeferredAction::None;
+                    };
+                    self.original_window_rects.insert(hwnd, rect);
+                    rect
+                }
             }
         };
 
@@ -908,6 +917,7 @@ impl AppState {
             hwnd,
             overlay_hwnd: self.hwnd,
             original_rect,
+            was_maximized,
             target,
         }))
     }
@@ -1751,6 +1761,7 @@ struct MoveWindowRequest {
     hwnd: isize,
     overlay_hwnd: HWND,
     original_rect: RECT,
+    was_maximized: bool,
     target: WindowMoveTarget,
 }
 
@@ -2941,18 +2952,43 @@ unsafe fn run_move_to_monitor(request: MoveWindowRequest) -> bool {
 
     move_window_to_overlay_desktop_if_needed(hwnd, request.overlay_hwnd);
 
+    let was_maximized = request.was_maximized || IsZoomed(hwnd).as_bool();
+    if was_maximized {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+    }
+    let original_rect = move_original_rect_after_restore(
+        request.original_rect,
+        was_maximized,
+        current_window_rect(hwnd),
+    );
+
     let moved = match request.target {
         WindowMoveTarget::Direction(direction) => {
-            move_window_to_monitor(hwnd, request.original_rect, direction)
+            move_window_to_monitor(hwnd, original_rect, direction)
         }
         WindowMoveTarget::ScreenNumber(screen_number) => {
-            move_window_to_screen_number(hwnd, request.original_rect, screen_number)
+            move_window_to_screen_number(hwnd, original_rect, screen_number)
         }
     };
-    if moved {
+    if was_maximized {
+        let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+    }
+    if moved || was_maximized {
         restore_overlay_focus(request.overlay_hwnd);
     }
     moved
+}
+
+fn move_original_rect_after_restore(
+    original_rect: RECT,
+    was_maximized: bool,
+    restored_rect: Option<RECT>,
+) -> RECT {
+    if was_maximized {
+        restored_rect.unwrap_or(original_rect)
+    } else {
+        original_rect
+    }
 }
 
 unsafe fn run_peek_window(request: PeekWindowRequest) -> Option<isize> {
@@ -3503,6 +3539,35 @@ mod tests {
         assert_eq!(
             result_context_menu_command_from_id(RESULT_CONTEXT_MOVE_SCREEN_BASE_ID + 4, &screens),
             ResultContextMenuCommand::None
+        );
+    }
+
+    #[test]
+    fn maximized_move_uses_restored_rect_as_original_size() {
+        let maximized_rect = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let restored_rect = RECT {
+            left: 100,
+            top: 120,
+            right: 900,
+            bottom: 620,
+        };
+
+        assert_eq!(
+            move_original_rect_after_restore(maximized_rect, true, Some(restored_rect)),
+            restored_rect
+        );
+        assert_eq!(
+            move_original_rect_after_restore(maximized_rect, true, None),
+            maximized_rect
+        );
+        assert_eq!(
+            move_original_rect_after_restore(maximized_rect, false, Some(restored_rect)),
+            maximized_rect
         );
     }
 
