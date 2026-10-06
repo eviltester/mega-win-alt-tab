@@ -8,10 +8,11 @@ so official releases are not code-signed at this time.
 
 Some antivirus products may show false positives because Mega Win Alt Tab uses
 automation-style Windows features: it registers a global hotkey, enumerates
-visible windows and window titles, captures DWM thumbnails, uses UI Automation
-to read browser tab titles, launches selected apps and folders, writes user
-configuration files under the user profile, can add a per-user startup registry
-entry, and checks GitHub Releases for updates.
+visible windows and window titles, enumerates running processes to identify
+background apps, captures DWM thumbnails, uses UI Automation to read browser tab
+titles, launches selected apps and folders, writes user configuration files
+under the user profile, can add a per-user startup registry entry, and checks
+GitHub Releases for updates.
 
 Mega Win Alt Tab is not malware and is not a virus. You are welcome to inspect
 the source code and build it yourself. Do not install releases from anywhere
@@ -124,10 +125,12 @@ the tab result is shown and the duplicate browser-window result is hidden.
 While the overlay is open, press `Ctrl+?` (or `Ctrl+/`) to switch the current
 search into app launcher mode. The app scans current-user and all-users Start
 Menu application shortcuts, Windows App Paths, Windows Start app catalog
-entries, and user-added favorite folders. Help files, documents, and website
-shortcuts in the Start Menu are skipped. It collapses duplicate app names and
-duplicate launch targets, then launches the selected app or opens the selected
-folder with Enter.
+entries, running background apps that match installed app identities, and
+user-added favorite folders. Help files, documents, and website shortcuts in the
+Start Menu are skipped. It collapses duplicate app names and duplicate launch
+targets, then launches the selected app or opens the selected folder with Enter.
+Background app results are labeled `Running in background`; activating one tries
+to show a hidden app window first, then falls back to launching the app again.
 
 To add a favorite folder, drag a folder onto the overlay. The app stores
 favorites in `%LOCALAPPDATA%\MegaWinAltTab\favorite-folders.json`, switches to

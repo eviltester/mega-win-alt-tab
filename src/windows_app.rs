@@ -14,7 +14,7 @@ mod tray;
 mod updates;
 mod virtual_desktops;
 
-use apps::{enumerate_apps, launch_app};
+use apps::{enumerate_apps, enumerate_background_apps, launch_app};
 use folders::{
     add_favorite_folder_path, dropped_file_paths, load_favorite_folders, normalize_folder_path,
     open_folder, remove_favorite_folder_path, save_favorite_folders,
@@ -275,6 +275,7 @@ struct AppState {
     help_rect: RECT,
     close_rect: RECT,
     apps: Vec<AppEntry>,
+    background_apps: Vec<AppEntry>,
     favorite_folders: Vec<FavoriteFolderEntry>,
     app_scan_completed: bool,
     app_scan_rx: Option<Receiver<Vec<AppEntry>>>,
@@ -363,6 +364,7 @@ impl AppState {
             help_rect: RECT::default(),
             close_rect: RECT::default(),
             apps: Vec::new(),
+            background_apps: Vec::new(),
             favorite_folders: load_favorite_folders(),
             app_scan_completed: false,
             app_scan_rx: None,
@@ -525,6 +527,7 @@ impl AppState {
         match scan_result {
             Ok(apps) => {
                 self.apps = apps;
+                self.refresh_background_apps();
                 self.app_scan_completed = true;
                 self.app_scan_rx = None;
                 let _ = KillTimer(self.hwnd, APP_SCAN_TIMER_ID);
@@ -544,6 +547,10 @@ impl AppState {
             }
             Err(TryRecvError::Empty) => {}
         }
+    }
+
+    unsafe fn refresh_background_apps(&mut self) {
+        self.background_apps = enumerate_background_apps(&self.apps);
     }
 
     unsafe fn start_update_check_if_needed(&mut self) {
@@ -604,7 +611,9 @@ impl AppState {
                 },
             ),
             OverlayMode::Apps => {
-                build_launcher_results(&self.query, &self.apps, &self.favorite_folders)
+                let mut apps = self.apps.clone();
+                apps.extend(self.background_apps.clone());
+                build_launcher_results(&self.query, &apps, &self.favorite_folders)
             }
         };
         if self.results.is_empty() {
@@ -699,6 +708,7 @@ impl AppState {
         self.mode = match self.mode {
             OverlayMode::WindowsAndTabs => {
                 self.start_app_scan_if_needed();
+                self.refresh_background_apps();
                 OverlayMode::Apps
             }
             OverlayMode::Apps => OverlayMode::WindowsAndTabs,
@@ -1692,6 +1702,7 @@ impl AppState {
         self.query = folder.name.clone();
         self.selected = 0;
         self.start_app_scan_if_needed();
+        self.refresh_background_apps();
         self.unregister_thumbnails();
         self.rebuild_results();
         self.select_folder_result(&folder.path);
@@ -2891,8 +2902,16 @@ unsafe fn run_activation(request: ActivationRequest) -> Option<isize> {
                 }
             }
         }
-        ActivationTarget::App { ref launch_path } => {
-            let _ = launch_app(request.overlay_hwnd, launch_path);
+        ActivationTarget::App {
+            ref launch_path,
+            process_id,
+        } => {
+            let shown = process_id.is_some_and(|process_id| {
+                show_background_process_window(process_id, request.overlay_hwnd)
+            });
+            if !shown {
+                let _ = launch_app(request.overlay_hwnd, launch_path);
+            }
         }
         ActivationTarget::Folder { ref path } => {
             let _ = open_folder(request.overlay_hwnd, path);
@@ -3017,6 +3036,49 @@ unsafe fn show_window_without_activation(hwnd: HWND) {
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
     );
+}
+
+unsafe fn show_background_process_window(process_id: u32, overlay_hwnd: HWND) -> bool {
+    struct EnumContext {
+        process_id: u32,
+        overlay_hwnd: HWND,
+        target: Option<HWND>,
+    }
+
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let context = &mut *(lparam.0 as *mut EnumContext);
+        if hwnd == context.overlay_hwnd || hwnd == GetShellWindow() || is_tool_window(hwnd) {
+            return BOOL(1);
+        }
+
+        let mut window_process_id = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut window_process_id));
+        if window_process_id != context.process_id || GetWindowTextLengthW(hwnd) <= 0 {
+            return BOOL(1);
+        }
+
+        context.target = Some(hwnd);
+        BOOL(0)
+    }
+
+    let mut context = EnumContext {
+        process_id,
+        overlay_hwnd,
+        target: None,
+    };
+    let _ = EnumWindows(
+        Some(callback),
+        LPARAM(&mut context as *mut EnumContext as isize),
+    );
+
+    let Some(hwnd) = context.target else {
+        return false;
+    };
+
+    move_window_to_overlay_desktop_if_needed(hwnd, overlay_hwnd);
+    let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+    let _ = SetForegroundWindow(hwnd);
+    true
 }
 
 fn selected_move_target_hwnd(result: &SearchResult, windows: &[WindowEntry]) -> Option<isize> {
@@ -3401,6 +3463,7 @@ mod tests {
         assert_eq!(
             result_thumbnail_hwnd(&result_with_target(ActivationTarget::App {
                 launch_path: "C:\\Tools\\Signal.lnk".to_string(),
+                process_id: None,
             })),
             None
         );
@@ -3444,6 +3507,7 @@ mod tests {
         ];
         let mut result = result_with_target(ActivationTarget::App {
             launch_path: "C:\\Users\\Example\\Signal.lnk".to_string(),
+            process_id: None,
         });
         result.title = "Signal".to_string();
 
@@ -3455,6 +3519,7 @@ mod tests {
         let windows = vec![window_entry(5, "Notes", "notepad")];
         let mut result = result_with_target(ActivationTarget::App {
             launch_path: "C:\\Users\\Example\\Signal.lnk".to_string(),
+            process_id: None,
         });
         result.title = "Signal".to_string();
 

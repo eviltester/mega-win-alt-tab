@@ -1,25 +1,36 @@
-use mega_win_alt_tab::core::{AppEntry, AppSource};
+use mega_win_alt_tab::core::{dedupe_apps, AppEntry, AppSource};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs;
+use std::mem::size_of;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use windows::core::{w, Interface, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HWND};
+use windows::Win32::Foundation::{
+    CloseHandle, BOOL, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE, HWND, LPARAM,
+};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED, STGM_READ,
 };
+use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
     HKEY_LOCAL_MACHINE, KEY_READ, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
 };
-use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, CREATE_NO_WINDOW,
+    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::Shell::{
     ApplicationActivationManager, IApplicationActivationManager, IShellLinkW, ShellExecuteW,
     ShellLink, AO_NONE,
 };
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowThreadProcessId,
+    IsWindowVisible, GWL_EXSTYLE, SW_SHOWNORMAL, WS_EX_TOOLWINDOW,
+};
 
 const APP_PATHS_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\App Paths");
 const APP_USER_MODEL_ID_PREFIX: &str = "appusermodelid:";
@@ -85,6 +96,8 @@ fn collect_apps_from_dir(root: &Path, source: AppSource, apps: &mut Vec<AppEntry
             name: name.to_string(),
             launch_path: path.to_string_lossy().to_string(),
             launch_identity,
+            running_background: false,
+            background_process_id: None,
             source,
         });
     }
@@ -197,6 +210,8 @@ unsafe fn collect_apps_from_app_paths(root: HKEY, source: AppSource, apps: &mut 
                     name: app_name_from_app_path_key(&key_name),
                     launch_identity: Some(launch_path.clone()),
                     launch_path,
+                    running_background: false,
+                    background_process_id: None,
                     source,
                 });
             }
@@ -340,9 +355,176 @@ fn collect_start_apps(apps: &mut Vec<AppEntry>) {
             name: name.to_string(),
             launch_identity: Some(launch_path.clone()),
             launch_path,
+            running_background: false,
+            background_process_id: None,
             source: AppSource::PackagedApp,
         });
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RunningProcess {
+    pub process_id: u32,
+    pub exe_path: String,
+}
+
+pub(super) unsafe fn enumerate_background_apps(installed_apps: &[AppEntry]) -> Vec<AppEntry> {
+    let visible_process_ids = visible_switcher_process_ids();
+    let processes = running_processes();
+    background_apps_from_processes(installed_apps, &processes, &visible_process_ids)
+}
+
+pub(super) fn background_apps_from_processes(
+    installed_apps: &[AppEntry],
+    processes: &[RunningProcess],
+    visible_process_ids: &HashSet<u32>,
+) -> Vec<AppEntry> {
+    if installed_apps.is_empty() {
+        return Vec::new();
+    }
+
+    let installed_apps = dedupe_apps(installed_apps);
+    let mut background_apps = Vec::new();
+    let mut seen_identities = HashSet::new();
+    for process in processes {
+        if process.process_id == 0 || visible_process_ids.contains(&process.process_id) {
+            continue;
+        }
+
+        let process_identity = normalize_launch_identity(&process.exe_path);
+        if process_identity.is_empty() || !seen_identities.insert(process_identity.clone()) {
+            continue;
+        }
+
+        let Some(app) = installed_apps
+            .iter()
+            .find(|app| app_matches_process_identity(app, &process_identity))
+        else {
+            continue;
+        };
+
+        let mut app = app.clone();
+        app.running_background = true;
+        app.background_process_id = Some(process.process_id);
+        background_apps.push(app);
+    }
+
+    background_apps
+}
+
+unsafe fn visible_switcher_process_ids() -> HashSet<u32> {
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let process_ids = &mut *(lparam.0 as *mut HashSet<u32>);
+        if !IsWindowVisible(hwnd).as_bool()
+            || is_tool_window(hwnd)
+            || GetWindowTextLengthW(hwnd) <= 0
+        {
+            return BOOL(1);
+        }
+
+        let mut process_id = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+        if process_id != 0 {
+            process_ids.insert(process_id);
+        }
+        BOOL(1)
+    }
+
+    let mut process_ids = HashSet::new();
+    let _ = EnumWindows(
+        Some(callback),
+        LPARAM(&mut process_ids as *mut HashSet<u32> as isize),
+    );
+    process_ids
+}
+
+unsafe fn running_processes() -> Vec<RunningProcess> {
+    let mut process_ids = enum_process_ids();
+    let current_process_id = GetCurrentProcessId();
+    process_ids.retain(|process_id| *process_id != 0 && *process_id != current_process_id);
+
+    process_ids
+        .into_iter()
+        .filter_map(|process_id| {
+            process_path(process_id).map(|exe_path| RunningProcess {
+                process_id,
+                exe_path,
+            })
+        })
+        .collect()
+}
+
+unsafe fn enum_process_ids() -> Vec<u32> {
+    let mut process_ids = vec![0u32; 2048];
+    loop {
+        let mut bytes_needed = 0u32;
+        let byte_capacity = (process_ids.len() * size_of::<u32>()) as u32;
+        if EnumProcesses(process_ids.as_mut_ptr(), byte_capacity, &mut bytes_needed).is_err() {
+            return Vec::new();
+        }
+
+        let count = bytes_needed as usize / size_of::<u32>();
+        if bytes_needed < byte_capacity {
+            process_ids.truncate(count);
+            return process_ids;
+        }
+
+        process_ids.resize(process_ids.len() * 2, 0);
+    }
+}
+
+unsafe fn process_path(process_id: u32) -> Option<String> {
+    let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, BOOL(0), process_id) else {
+        return None;
+    };
+
+    let path = query_process_path(process);
+    let _ = CloseHandle(process);
+    path
+}
+
+unsafe fn query_process_path(process: HANDLE) -> Option<String> {
+    let mut buffer = vec![0u16; 32768];
+    let mut len = buffer.len() as u32;
+    QueryFullProcessImageNameW(
+        process,
+        PROCESS_NAME_FORMAT(0),
+        PWSTR(buffer.as_mut_ptr()),
+        &mut len,
+    )
+    .is_ok()
+    .then(|| String::from_utf16_lossy(&buffer[..len as usize]))
+    .filter(|path| !path.trim().is_empty())
+}
+
+unsafe fn is_tool_window(hwnd: HWND) -> bool {
+    let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    ex_style & WS_EX_TOOLWINDOW.0 != 0
+}
+
+fn app_matches_process_identity(app: &AppEntry, process_identity: &str) -> bool {
+    app_launch_identity_candidates(app)
+        .iter()
+        .any(|candidate| candidate == process_identity)
+}
+
+fn app_launch_identity_candidates(app: &AppEntry) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(identity) = &app.launch_identity {
+        candidates.push(normalize_launch_identity(identity));
+    }
+    candidates.push(normalize_launch_identity(&app.launch_path));
+    candidates.retain(|candidate| !candidate.is_empty());
+    candidates.dedup();
+    candidates
+}
+
+fn normalize_launch_identity(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .to_ascii_lowercase()
 }
 
 fn start_app_entries() -> Vec<StartAppEntry> {
@@ -502,6 +684,7 @@ fn utf16z_to_string(value: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_dir(name: &str) -> PathBuf {
@@ -515,6 +698,17 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("test directory should be created");
         dir
+    }
+
+    fn test_app(name: &str, launch_path: &str, launch_identity: Option<&str>) -> AppEntry {
+        AppEntry {
+            name: name.to_string(),
+            launch_path: launch_path.to_string(),
+            launch_identity: launch_identity.map(str::to_string),
+            running_background: false,
+            background_process_id: None,
+            source: AppSource::UserStartMenu,
+        }
     }
 
     #[test]
@@ -571,6 +765,54 @@ mod tests {
             .all(|app| app.source == AppSource::UserStartMenu));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn background_apps_match_installed_apps_by_launch_identity() {
+        let installed = vec![test_app(
+            "Signal",
+            r"C:\Users\Example\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Signal.lnk",
+            Some(r"C:\Users\Example\AppData\Local\Programs\Signal\Signal.exe"),
+        )];
+        let processes = vec![
+            RunningProcess {
+                process_id: 10,
+                exe_path: r"C:\Users\Example\AppData\Local\Programs\Signal\Signal.exe".to_string(),
+            },
+            RunningProcess {
+                process_id: 11,
+                exe_path: r"C:\Tools\UnindexedBackground.exe".to_string(),
+            },
+        ];
+        let visible_process_ids = HashSet::new();
+
+        let background =
+            background_apps_from_processes(&installed, &processes, &visible_process_ids);
+
+        assert_eq!(background.len(), 1);
+        assert_eq!(background[0].name, "Signal");
+        assert_eq!(background[0].background_process_id, Some(10));
+        assert!(background[0].running_background);
+        assert_eq!(background[0].launch_path, installed[0].launch_path);
+    }
+
+    #[test]
+    fn background_apps_ignore_visible_processes() {
+        let installed = vec![test_app(
+            "Signal",
+            r"C:\Users\Example\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Signal.lnk",
+            Some(r"C:\Users\Example\AppData\Local\Programs\Signal\Signal.exe"),
+        )];
+        let processes = vec![RunningProcess {
+            process_id: 10,
+            exe_path: r"C:\Users\Example\AppData\Local\Programs\Signal\Signal.exe".to_string(),
+        }];
+        let visible_process_ids = HashSet::from([10]);
+
+        let background =
+            background_apps_from_processes(&installed, &processes, &visible_process_ids);
+
+        assert!(background.is_empty());
     }
 
     #[test]

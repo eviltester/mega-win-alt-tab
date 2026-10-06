@@ -55,6 +55,8 @@ pub struct AppEntry {
     pub name: String,
     pub launch_path: String,
     pub launch_identity: Option<String>,
+    pub running_background: bool,
+    pub background_process_id: Option<u32>,
     pub source: AppSource,
 }
 
@@ -129,6 +131,7 @@ pub enum ActivationTarget {
     },
     App {
         launch_path: String,
+        process_id: Option<u32>,
     },
     Folder {
         path: String,
@@ -361,11 +364,12 @@ pub fn build_app_results(query: &str, apps: &[AppEntry]) -> Vec<SearchResult> {
         results.push(SearchResult {
             kind: SearchResultKind::App,
             title: app.name.clone(),
-            subtitle: "Application".to_string(),
+            subtitle: app_result_subtitle(app).to_string(),
             screen_number: None,
             rank: score,
             target: ActivationTarget::App {
                 launch_path: app.launch_path.clone(),
+                process_id: app.background_process_id,
             },
         });
     }
@@ -466,8 +470,17 @@ pub fn dedupe_apps(apps: &[AppEntry]) -> Vec<AppEntry> {
             .iter_mut()
             .find(|existing| apps_are_duplicates(existing, app))
         {
+            let running_background = existing.running_background || app.running_background;
+            let background_process_id =
+                existing.background_process_id.or(app.background_process_id);
             if should_replace_app(existing, app) {
-                *existing = app.clone();
+                let mut replacement = app.clone();
+                replacement.running_background = running_background;
+                replacement.background_process_id = background_process_id;
+                *existing = replacement;
+            } else {
+                existing.running_background = running_background;
+                existing.background_process_id = background_process_id;
             }
             continue;
         }
@@ -534,6 +547,14 @@ fn app_source_priority(source: AppSource) -> i32 {
         AppSource::AllUsersStartMenu => 2,
         AppSource::MachineAppPath => 3,
         AppSource::PackagedApp => 4,
+    }
+}
+
+fn app_result_subtitle(app: &AppEntry) -> &'static str {
+    if app.running_background {
+        "Running in background"
+    } else {
+        "Application"
     }
 }
 
@@ -697,6 +718,8 @@ mod tests {
             name: name.to_string(),
             launch_path: launch_path.to_string(),
             launch_identity: None,
+            running_background: false,
+            background_process_id: None,
             source,
         }
     }
@@ -711,6 +734,8 @@ mod tests {
             name: name.to_string(),
             launch_path: launch_path.to_string(),
             launch_identity: Some(launch_identity.to_string()),
+            running_background: false,
+            background_process_id: None,
             source,
         }
     }
@@ -824,6 +849,29 @@ mod tests {
     }
 
     #[test]
+    fn app_results_label_running_background_apps() {
+        let mut signal = app(
+            "Signal",
+            r"C:\Users\Example\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Signal.lnk",
+            AppSource::UserStartMenu,
+        );
+        signal.running_background = true;
+        signal.background_process_id = Some(42);
+
+        let results = build_app_results("signal", &[signal]);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].subtitle, "Running in background");
+        assert!(matches!(
+            results[0].target,
+            ActivationTarget::App {
+                process_id: Some(42),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn app_dedupe_prefers_current_user_shortcut() {
         let apps = vec![
             app(
@@ -866,6 +914,31 @@ mod tests {
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].name, "Google Chrome");
         assert_eq!(deduped[0].source, AppSource::AllUsersStartMenu);
+    }
+
+    #[test]
+    fn app_dedupe_preserves_background_state_on_installed_match() {
+        let installed = app_with_identity(
+            "Signal",
+            r"C:\Users\Example\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Signal.lnk",
+            r"C:\Users\Example\AppData\Local\Programs\Signal\Signal.exe",
+            AppSource::UserStartMenu,
+        );
+        let mut background = app_with_identity(
+            "Signal",
+            r"C:\Users\Example\AppData\Local\Programs\Signal\Signal.exe",
+            r"C:\Users\Example\AppData\Local\Programs\Signal\Signal.exe",
+            AppSource::MachineAppPath,
+        );
+        background.running_background = true;
+        background.background_process_id = Some(55);
+
+        let deduped = dedupe_apps(&[installed, background]);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].source, AppSource::UserStartMenu);
+        assert!(deduped[0].running_background);
+        assert_eq!(deduped[0].background_process_id, Some(55));
     }
 
     #[test]
