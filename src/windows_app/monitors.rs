@@ -16,6 +16,13 @@ pub(super) enum MonitorMoveDirection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScreenAdjustment {
+    Center,
+    BeforeCenter,
+    AfterCenter,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MonitorEntry {
     handle: isize,
     number: u32,
@@ -193,6 +200,24 @@ pub(super) unsafe fn move_window_to_screen_number(
     move_window_between_monitors(hwnd, original_window_rect, current.rect, target.rect)
 }
 
+pub(super) unsafe fn adjust_window_on_screen(hwnd: HWND, adjustment: ScreenAdjustment) -> bool {
+    let Some(monitor_rect) = monitor_rect_for_window(hwnd) else {
+        return false;
+    };
+
+    let placement = screen_adjustment_window_placement(monitor_rect, adjustment);
+    SetWindowPos(
+        hwnd,
+        None,
+        placement.left,
+        placement.top,
+        placement.width,
+        placement.height,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    )
+    .is_ok()
+}
+
 unsafe fn move_window_between_monitors(
     hwnd: HWND,
     original_window_rect: RECT,
@@ -264,6 +289,149 @@ fn next_monitor_window_placement(
         width,
         height,
     }
+}
+
+fn screen_adjustment_window_placement(
+    monitor_rect: RECT,
+    adjustment: ScreenAdjustment,
+) -> WindowPlacement {
+    match adjustment {
+        ScreenAdjustment::Center => centered_screen_window_placement(monitor_rect),
+        ScreenAdjustment::BeforeCenter => before_center_screen_window_placement(monitor_rect),
+        ScreenAdjustment::AfterCenter => after_center_screen_window_placement(monitor_rect),
+    }
+}
+
+fn centered_screen_window_placement(monitor_rect: RECT) -> WindowPlacement {
+    let screen_width = rect_width(monitor_rect);
+    let screen_height = rect_height(monitor_rect);
+
+    if screen_height > screen_width {
+        let side = screen_width;
+        return WindowPlacement {
+            left: monitor_rect.left,
+            top: monitor_rect.top + (screen_height - side) / 2,
+            width: side,
+            height: side,
+        };
+    }
+
+    if screen_width == screen_height || is_classic_landscape_ratio(screen_width, screen_height) {
+        return WindowPlacement {
+            left: monitor_rect.left,
+            top: monitor_rect.top,
+            width: screen_width,
+            height: screen_height,
+        };
+    }
+
+    let side = screen_height;
+    WindowPlacement {
+        left: monitor_rect.left + (screen_width - side) / 2,
+        top: monitor_rect.top,
+        width: side,
+        height: side,
+    }
+}
+
+fn before_center_screen_window_placement(monitor_rect: RECT) -> WindowPlacement {
+    let center = centered_screen_window_placement(monitor_rect);
+    let screen_width = rect_width(monitor_rect);
+    let screen_height = rect_height(monitor_rect);
+
+    if screen_height > screen_width {
+        let band_height = center.top - monitor_rect.top;
+        if band_height > 0 {
+            return WindowPlacement {
+                left: monitor_rect.left,
+                top: monitor_rect.top,
+                width: screen_width,
+                height: band_height,
+            };
+        }
+
+        return WindowPlacement {
+            left: monitor_rect.left,
+            top: monitor_rect.top,
+            width: screen_width,
+            height: (screen_height / 2).max(1),
+        };
+    }
+
+    let band_width = center.left - monitor_rect.left;
+    if band_width > 0 {
+        return WindowPlacement {
+            left: monitor_rect.left,
+            top: monitor_rect.top,
+            width: band_width,
+            height: screen_height,
+        };
+    }
+
+    WindowPlacement {
+        left: monitor_rect.left,
+        top: monitor_rect.top,
+        width: (screen_width / 2).max(1),
+        height: screen_height,
+    }
+}
+
+fn after_center_screen_window_placement(monitor_rect: RECT) -> WindowPlacement {
+    let center = centered_screen_window_placement(monitor_rect);
+    let screen_width = rect_width(monitor_rect);
+    let screen_height = rect_height(monitor_rect);
+
+    if screen_height > screen_width {
+        let center_bottom = center.top + center.height;
+        let band_height = monitor_rect.bottom - center_bottom;
+        if band_height > 0 {
+            return WindowPlacement {
+                left: monitor_rect.left,
+                top: center_bottom,
+                width: screen_width,
+                height: band_height,
+            };
+        }
+
+        let top = monitor_rect.top + screen_height / 2;
+        return WindowPlacement {
+            left: monitor_rect.left,
+            top,
+            width: screen_width,
+            height: (monitor_rect.bottom - top).max(1),
+        };
+    }
+
+    let center_right = center.left + center.width;
+    let band_width = monitor_rect.right - center_right;
+    if band_width > 0 {
+        return WindowPlacement {
+            left: center_right,
+            top: monitor_rect.top,
+            width: band_width,
+            height: screen_height,
+        };
+    }
+
+    let left = monitor_rect.left + screen_width / 2;
+    WindowPlacement {
+        left,
+        top: monitor_rect.top,
+        width: (monitor_rect.right - left).max(1),
+        height: screen_height,
+    }
+}
+
+fn rect_width(rect: RECT) -> i32 {
+    (rect.right - rect.left).max(1)
+}
+
+fn rect_height(rect: RECT) -> i32 {
+    (rect.bottom - rect.top).max(1)
+}
+
+fn is_classic_landscape_ratio(width: i32, height: i32) -> bool {
+    width > height && (width as i64 * 3) <= (height as i64 * 4)
 }
 
 fn utf16z_to_string(value: &[u16]) -> String {
@@ -404,6 +572,120 @@ mod tests {
                 left: 1280,
                 top: 0,
                 width: 2000,
+                height: 1200,
+            }
+        );
+    }
+
+    #[test]
+    fn screen_adjustment_places_square_and_bands_on_portrait_screen() {
+        let screen = RECT {
+            left: 0,
+            top: 0,
+            right: 1080,
+            bottom: 1920,
+        };
+
+        assert_eq!(
+            screen_adjustment_window_placement(screen, ScreenAdjustment::Center),
+            WindowPlacement {
+                left: 0,
+                top: 420,
+                width: 1080,
+                height: 1080,
+            }
+        );
+        assert_eq!(
+            screen_adjustment_window_placement(screen, ScreenAdjustment::BeforeCenter),
+            WindowPlacement {
+                left: 0,
+                top: 0,
+                width: 1080,
+                height: 420,
+            }
+        );
+        assert_eq!(
+            screen_adjustment_window_placement(screen, ScreenAdjustment::AfterCenter),
+            WindowPlacement {
+                left: 0,
+                top: 1500,
+                width: 1080,
+                height: 420,
+            }
+        );
+    }
+
+    #[test]
+    fn screen_adjustment_places_square_and_bands_on_widescreen_landscape() {
+        let screen = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+
+        assert_eq!(
+            screen_adjustment_window_placement(screen, ScreenAdjustment::Center),
+            WindowPlacement {
+                left: 420,
+                top: 0,
+                width: 1080,
+                height: 1080,
+            }
+        );
+        assert_eq!(
+            screen_adjustment_window_placement(screen, ScreenAdjustment::BeforeCenter),
+            WindowPlacement {
+                left: 0,
+                top: 0,
+                width: 420,
+                height: 1080,
+            }
+        );
+        assert_eq!(
+            screen_adjustment_window_placement(screen, ScreenAdjustment::AfterCenter),
+            WindowPlacement {
+                left: 1500,
+                top: 0,
+                width: 420,
+                height: 1080,
+            }
+        );
+    }
+
+    #[test]
+    fn screen_adjustment_fills_classic_landscape_without_maximizing() {
+        let screen = RECT {
+            left: 0,
+            top: 0,
+            right: 1600,
+            bottom: 1200,
+        };
+
+        assert_eq!(
+            screen_adjustment_window_placement(screen, ScreenAdjustment::Center),
+            WindowPlacement {
+                left: 0,
+                top: 0,
+                width: 1600,
+                height: 1200,
+            }
+        );
+        assert_eq!(
+            screen_adjustment_window_placement(screen, ScreenAdjustment::BeforeCenter),
+            WindowPlacement {
+                left: 0,
+                top: 0,
+                width: 800,
+                height: 1200,
+            }
+        );
+        assert_eq!(
+            screen_adjustment_window_placement(screen, ScreenAdjustment::AfterCenter),
+            WindowPlacement {
+                left: 800,
+                top: 0,
+                width: 800,
                 height: 1200,
             }
         );

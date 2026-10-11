@@ -22,9 +22,9 @@ use folders::{
 use icons::create_mega_icon;
 use input::{mouse_point, point_in_rect};
 use monitors::{
-    current_window_rect, enumerate_monitor_numbers, enumerate_monitor_screen_numbers,
-    monitor_rect_for_window, move_window_to_monitor, move_window_to_screen_number,
-    window_screen_number, MonitorMoveDirection,
+    adjust_window_on_screen, current_window_rect, enumerate_monitor_numbers,
+    enumerate_monitor_screen_numbers, monitor_rect_for_window, move_window_to_monitor,
+    move_window_to_screen_number, window_screen_number, MonitorMoveDirection, ScreenAdjustment,
 };
 use startup::{
     is_run_at_startup_enabled, legacy_startup_entries, remove_startup_entries, set_run_at_startup,
@@ -84,7 +84,7 @@ use windows::Win32::UI::Accessibility::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, RegisterHotKey, SetFocus, TrackMouseEvent, UnregisterHotKey, MOD_ALT, MOD_CONTROL,
     MOD_NOREPEAT, TME_LEAVE, TRACKMOUSEEVENT, VK_BACK, VK_CONTROL, VK_D, VK_DOWN, VK_ESCAPE,
-    VK_LEFT, VK_OEM_2, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
+    VK_HOME, VK_LEFT, VK_NEXT, VK_OEM_2, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, IVirtualDesktopManager, ShellExecuteW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -135,7 +135,7 @@ const RESULT_CONTEXT_CLOSE_ID: usize = 2004;
 const RESULT_CONTEXT_MOVE_PREVIOUS_ID: usize = 2005;
 const RESULT_CONTEXT_MOVE_NEXT_ID: usize = 2006;
 const RESULT_CONTEXT_MOVE_SCREEN_BASE_ID: usize = 2100;
-const HELP_LINES: [&str; 12] = [
+const HELP_LINES: [&str; 15] = [
     concat!("Version ", env!("CARGO_PKG_VERSION")),
     "Esc - close",
     "Up / Down - move selection",
@@ -144,6 +144,9 @@ const HELP_LINES: [&str; 12] = [
     "Ctrl + F - maximize or restore selected window",
     "Ctrl + S - minimize selected window",
     "Ctrl + W - close selected window or remove favorite folder",
+    "Ctrl + Home - center selected window on screen",
+    "Ctrl + Page Up - place selected window before center",
+    "Ctrl + Page Down - place selected window after center",
     "Ctrl + Left - move selected window to previous screen in layout",
     "Ctrl + Right - move selected window to next screen in layout",
     "Ctrl + D - search all desktops",
@@ -663,6 +666,15 @@ impl AppState {
             key if ctrl_down && key == KEY_F => return self.selected_toggle_maximize(),
             key if ctrl_down && key == KEY_S => return self.selected_minimize_window(),
             key if ctrl_down && key == KEY_W => return self.selected_close_window(),
+            key if ctrl_down && key == VK_HOME.0 as u32 => {
+                return self.selected_adjust_window(ScreenAdjustment::Center);
+            }
+            key if ctrl_down && key == VK_PRIOR.0 as u32 => {
+                return self.selected_adjust_window(ScreenAdjustment::BeforeCenter);
+            }
+            key if ctrl_down && key == VK_NEXT.0 as u32 => {
+                return self.selected_adjust_window(ScreenAdjustment::AfterCenter);
+            }
             key if ctrl_down && is_app_mode_toggle_key(key) => self.toggle_app_mode(),
             key if ctrl_down
                 && self.mode == OverlayMode::WindowsAndTabs
@@ -809,6 +821,21 @@ impl AppState {
         DeferredAction::MinimizeWindow(Box::new(MinimizeWindowRequest {
             hwnd,
             overlay_hwnd: self.hwnd,
+        }))
+    }
+
+    fn selected_adjust_window(&self, adjustment: ScreenAdjustment) -> DeferredAction {
+        let Some(result) = self.results.get(self.selected).cloned() else {
+            return DeferredAction::None;
+        };
+        let Some(hwnd) = selected_move_target_hwnd(&result, &self.windows) else {
+            return DeferredAction::None;
+        };
+
+        DeferredAction::AdjustWindow(Box::new(AdjustWindowRequest {
+            hwnd,
+            overlay_hwnd: self.hwnd,
+            adjustment,
         }))
     }
 
@@ -1752,6 +1779,7 @@ impl Drop for AppState {
 enum DeferredAction {
     None,
     Activate(Box<ActivationRequest>),
+    AdjustWindow(Box<AdjustWindowRequest>),
     CloseWindow(Box<CloseWindowRequest>),
     MinimizeWindow(Box<MinimizeWindowRequest>),
     MoveToMonitor(Box<MoveWindowRequest>),
@@ -1766,6 +1794,12 @@ struct ActivationRequest {
     overlay_hwnd: HWND,
     restore_overlay_focus: bool,
     highlight_target: Option<isize>,
+}
+
+struct AdjustWindowRequest {
+    hwnd: isize,
+    overlay_hwnd: HWND,
+    adjustment: ScreenAdjustment,
 }
 
 struct MoveWindowRequest {
@@ -1805,6 +1839,10 @@ impl DeferredAction {
                 highlight_target: run_activation(*request),
                 ..Default::default()
             },
+            Self::AdjustWindow(request) => {
+                run_adjust_window(*request);
+                DeferredOutcome::default()
+            }
             Self::CloseWindow(request) => {
                 let _ = run_close_window(*request);
                 DeferredOutcome::default()
@@ -2961,6 +2999,21 @@ unsafe fn run_toggle_maximize(request: ToggleMaximizeRequest) {
     };
     let _ = ShowWindow(hwnd, show_command);
     restore_overlay_focus(request.overlay_hwnd);
+}
+
+unsafe fn run_adjust_window(request: AdjustWindowRequest) {
+    let hwnd = hwnd_from_isize(request.hwnd);
+    if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+
+    move_window_to_overlay_desktop_if_needed(hwnd, request.overlay_hwnd);
+    if IsZoomed(hwnd).as_bool() {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+    }
+    if adjust_window_on_screen(hwnd, request.adjustment) {
+        restore_overlay_focus(request.overlay_hwnd);
+    }
 }
 
 unsafe fn run_move_to_monitor(request: MoveWindowRequest) -> bool {

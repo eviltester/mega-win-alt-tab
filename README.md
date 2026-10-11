@@ -69,6 +69,9 @@ GitHub Releases page when clicked. It does not auto-download or install updates.
 | `Ctrl+F` | Maximize the selected window, or restore it if it is already maximized. |
 | `Ctrl+S` | Minimize the selected window. |
 | `Ctrl+W` | Close the selected window, or remove the selected favorite folder in app mode. |
+| `Ctrl+Home` | Center the selected window as a square on wide or portrait screens, or fill classic 5:4 and 4:3 screens without maximizing. |
+| `Ctrl+Page Up` | Size the selected window into the top or left band before the centered area. |
+| `Ctrl+Page Down` | Size the selected window into the bottom or right band after the centered area. |
 | `Ctrl+Left` | Move the selected window/tab parent, or matching running app window, to the previous screen in the Windows layout order. |
 | `Ctrl+Right` | Move the selected window/tab parent, or matching running app window, to the next screen in the Windows layout order. |
 | `Ctrl+D` | Toggle all-desktops mode for windows and tabs. |
