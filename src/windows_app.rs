@@ -14,7 +14,7 @@ mod tray;
 mod updates;
 mod virtual_desktops;
 
-use apps::{enumerate_apps, enumerate_background_apps, launch_app};
+use apps::{enumerate_apps, enumerate_background_apps, launch_app, uses_registered_app_activation};
 use folders::{
     add_favorite_folder_path, dropped_file_paths, load_favorite_folders, normalize_folder_path,
     open_folder, remove_favorite_folder_path, save_favorite_folders,
@@ -2944,11 +2944,20 @@ unsafe fn run_activation(request: ActivationRequest) -> Option<isize> {
             ref launch_path,
             process_id,
         } => {
-            let shown = process_id.is_some_and(|process_id| {
-                show_background_process_window(process_id, request.overlay_hwnd)
-            });
-            if !shown {
-                let _ = launch_app(request.overlay_hwnd, launch_path);
+            if uses_registered_app_activation(launch_path) {
+                let launched = launch_app(request.overlay_hwnd, launch_path);
+                if !launched {
+                    let _ = process_id.is_some_and(|process_id| {
+                        show_background_process_window(process_id, request.overlay_hwnd)
+                    });
+                }
+            } else {
+                let shown = process_id.is_some_and(|process_id| {
+                    show_background_process_window(process_id, request.overlay_hwnd)
+                });
+                if !shown {
+                    let _ = launch_app(request.overlay_hwnd, launch_path);
+                }
             }
         }
         ActivationTarget::Folder { ref path } => {

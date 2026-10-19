@@ -132,8 +132,11 @@ entries, running background apps that match installed app identities, and
 user-added favorite folders. Help files, documents, and website shortcuts in the
 Start Menu are skipped. It collapses duplicate app names and duplicate launch
 targets, then launches the selected app or opens the selected folder with Enter.
-Background app results are labeled `Running in background`; activating one tries
-to show a hidden app window first, then falls back to launching the app again.
+Background app results are labeled `Running in background`. Multi-process apps
+are treated as one application, and Mega Win Alt Tab prefers a process that owns
+a restorable hidden window. Packaged apps are activated through their registered
+Windows app identity; other apps try to show a hidden app window first, then fall
+back to launching the app again.
 
 To add a favorite folder, drag a folder onto the overlay. The app stores
 favorites in `%LOCALAPPDATA%\MegaWinAltTab\favorite-folders.json`, switches to

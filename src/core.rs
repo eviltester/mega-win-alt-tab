@@ -543,10 +543,10 @@ fn should_replace_app(existing: &AppEntry, candidate: &AppEntry) -> bool {
 fn app_source_priority(source: AppSource) -> i32 {
     match source {
         AppSource::UserStartMenu => 0,
-        AppSource::UserAppPath => 1,
-        AppSource::AllUsersStartMenu => 2,
-        AppSource::MachineAppPath => 3,
-        AppSource::PackagedApp => 4,
+        AppSource::AllUsersStartMenu => 1,
+        AppSource::PackagedApp => 2,
+        AppSource::UserAppPath => 3,
+        AppSource::MachineAppPath => 4,
     }
 }
 
@@ -939,6 +939,31 @@ mod tests {
         assert_eq!(deduped[0].source, AppSource::UserStartMenu);
         assert!(deduped[0].running_background);
         assert_eq!(deduped[0].background_process_id, Some(55));
+    }
+
+    #[test]
+    fn app_dedupe_prefers_registered_start_app_over_windows_app_path() {
+        let app_path = app_with_identity(
+            "Slack",
+            r"C:\Program Files\WindowsApps\com.tinyspeck.slackdesktop\app\Slack.exe",
+            r"C:\Program Files\WindowsApps\com.tinyspeck.slackdesktop\app\Slack.exe",
+            AppSource::UserAppPath,
+        );
+        let registered_app = app_with_identity(
+            "Slack",
+            "appusermodelid:com.tinyspeck.slackdesktop_8yrtsj140pw4g!Slack",
+            "appusermodelid:com.tinyspeck.slackdesktop_8yrtsj140pw4g!Slack",
+            AppSource::PackagedApp,
+        );
+
+        let deduped = dedupe_apps(&[app_path, registered_app]);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].source, AppSource::PackagedApp);
+        assert_eq!(
+            deduped[0].launch_path,
+            "appusermodelid:com.tinyspeck.slackdesktop_8yrtsj140pw4g!Slack"
+        );
     }
 
     #[test]

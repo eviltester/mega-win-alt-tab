@@ -1,4 +1,4 @@
-use mega_win_alt_tab::core::{dedupe_apps, AppEntry, AppSource};
+use mega_win_alt_tab::core::{AppEntry, AppSource};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
@@ -369,30 +369,46 @@ pub(super) struct RunningProcess {
 }
 
 pub(super) unsafe fn enumerate_background_apps(installed_apps: &[AppEntry]) -> Vec<AppEntry> {
-    let visible_process_ids = visible_switcher_process_ids();
+    let window_processes = switcher_window_processes();
     let processes = running_processes();
-    background_apps_from_processes(installed_apps, &processes, &visible_process_ids)
+    background_apps_from_processes(
+        installed_apps,
+        &processes,
+        &window_processes.visible,
+        &window_processes.restorable,
+    )
 }
 
 pub(super) fn background_apps_from_processes(
     installed_apps: &[AppEntry],
     processes: &[RunningProcess],
     visible_process_ids: &HashSet<u32>,
+    restorable_process_ids: &HashSet<u32>,
 ) -> Vec<AppEntry> {
     if installed_apps.is_empty() {
         return Vec::new();
     }
 
-    let installed_apps = dedupe_apps(installed_apps);
     let mut background_apps = Vec::new();
     let mut seen_identities = HashSet::new();
     for process in processes {
-        if process.process_id == 0 || visible_process_ids.contains(&process.process_id) {
+        if process.process_id == 0 {
             continue;
         }
 
         let process_identity = normalize_launch_identity(&process.exe_path);
         if process_identity.is_empty() || !seen_identities.insert(process_identity.clone()) {
+            continue;
+        }
+
+        let matching_processes = processes.iter().filter(|candidate| {
+            candidate.process_id != 0
+                && normalize_launch_identity(&candidate.exe_path) == process_identity
+        });
+        if matching_processes
+            .clone()
+            .any(|candidate| visible_process_ids.contains(&candidate.process_id))
+        {
             continue;
         }
 
@@ -405,37 +421,47 @@ pub(super) fn background_apps_from_processes(
 
         let mut app = app.clone();
         app.running_background = true;
-        app.background_process_id = Some(process.process_id);
+        app.background_process_id = matching_processes
+            .clone()
+            .find(|candidate| restorable_process_ids.contains(&candidate.process_id))
+            .or_else(|| matching_processes.into_iter().next())
+            .map(|candidate| candidate.process_id);
         background_apps.push(app);
     }
 
     background_apps
 }
 
-unsafe fn visible_switcher_process_ids() -> HashSet<u32> {
+#[derive(Default)]
+struct SwitcherWindowProcesses {
+    visible: HashSet<u32>,
+    restorable: HashSet<u32>,
+}
+
+unsafe fn switcher_window_processes() -> SwitcherWindowProcesses {
     unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let process_ids = &mut *(lparam.0 as *mut HashSet<u32>);
-        if !IsWindowVisible(hwnd).as_bool()
-            || is_tool_window(hwnd)
-            || GetWindowTextLengthW(hwnd) <= 0
-        {
+        let processes = &mut *(lparam.0 as *mut SwitcherWindowProcesses);
+        if is_tool_window(hwnd) || GetWindowTextLengthW(hwnd) <= 0 {
             return BOOL(1);
         }
 
         let mut process_id = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut process_id));
         if process_id != 0 {
-            process_ids.insert(process_id);
+            processes.restorable.insert(process_id);
+            if IsWindowVisible(hwnd).as_bool() {
+                processes.visible.insert(process_id);
+            }
         }
         BOOL(1)
     }
 
-    let mut process_ids = HashSet::new();
+    let mut processes = SwitcherWindowProcesses::default();
     let _ = EnumWindows(
         Some(callback),
-        LPARAM(&mut process_ids as *mut HashSet<u32> as isize),
+        LPARAM(&mut processes as *mut SwitcherWindowProcesses as isize),
     );
-    process_ids
+    processes
 }
 
 unsafe fn running_processes() -> Vec<RunningProcess> {
@@ -604,6 +630,10 @@ fn app_user_model_id_from_launch_path(launch_path: &str) -> Option<&str> {
         .trim()
         .strip_prefix(APP_USER_MODEL_ID_PREFIX)
         .filter(|app_id| !app_id.trim().is_empty())
+}
+
+pub(super) fn uses_registered_app_activation(launch_path: &str) -> bool {
+    app_user_model_id_from_launch_path(launch_path).is_some()
 }
 
 fn is_absolute_executable_launch_target(target: &str) -> bool {
@@ -785,9 +815,14 @@ mod tests {
             },
         ];
         let visible_process_ids = HashSet::new();
+        let restorable_process_ids = HashSet::new();
 
-        let background =
-            background_apps_from_processes(&installed, &processes, &visible_process_ids);
+        let background = background_apps_from_processes(
+            &installed,
+            &processes,
+            &visible_process_ids,
+            &restorable_process_ids,
+        );
 
         assert_eq!(background.len(), 1);
         assert_eq!(background[0].name, "Signal");
@@ -808,11 +843,77 @@ mod tests {
             exe_path: r"C:\Users\Example\AppData\Local\Programs\Signal\Signal.exe".to_string(),
         }];
         let visible_process_ids = HashSet::from([10]);
+        let restorable_process_ids = HashSet::from([10]);
 
-        let background =
-            background_apps_from_processes(&installed, &processes, &visible_process_ids);
+        let background = background_apps_from_processes(
+            &installed,
+            &processes,
+            &visible_process_ids,
+            &restorable_process_ids,
+        );
 
         assert!(background.is_empty());
+    }
+
+    #[test]
+    fn background_apps_ignore_an_executable_when_any_sibling_process_is_visible() {
+        let installed = vec![test_app(
+            "Slack",
+            r"C:\Program Files\WindowsApps\Slack\Slack.exe",
+            Some(r"C:\Program Files\WindowsApps\Slack\Slack.exe"),
+        )];
+        let processes = vec![
+            RunningProcess {
+                process_id: 10,
+                exe_path: r"C:\Program Files\WindowsApps\Slack\Slack.exe".to_string(),
+            },
+            RunningProcess {
+                process_id: 11,
+                exe_path: r"C:\Program Files\WindowsApps\Slack\Slack.exe".to_string(),
+            },
+        ];
+        let visible_process_ids = HashSet::from([11]);
+        let restorable_process_ids = HashSet::from([11]);
+
+        let background = background_apps_from_processes(
+            &installed,
+            &processes,
+            &visible_process_ids,
+            &restorable_process_ids,
+        );
+
+        assert!(background.is_empty());
+    }
+
+    #[test]
+    fn background_apps_prefer_process_that_owns_a_restorable_window() {
+        let installed = vec![test_app(
+            "Slack",
+            r"C:\Program Files\WindowsApps\Slack\Slack.exe",
+            Some(r"C:\Program Files\WindowsApps\Slack\Slack.exe"),
+        )];
+        let processes = vec![
+            RunningProcess {
+                process_id: 10,
+                exe_path: r"C:\Program Files\WindowsApps\Slack\Slack.exe".to_string(),
+            },
+            RunningProcess {
+                process_id: 11,
+                exe_path: r"C:\Program Files\WindowsApps\Slack\Slack.exe".to_string(),
+            },
+        ];
+        let visible_process_ids = HashSet::new();
+        let restorable_process_ids = HashSet::from([11]);
+
+        let background = background_apps_from_processes(
+            &installed,
+            &processes,
+            &visible_process_ids,
+            &restorable_process_ids,
+        );
+
+        assert_eq!(background.len(), 1);
+        assert_eq!(background[0].background_process_id, Some(11));
     }
 
     #[test]
@@ -888,6 +989,8 @@ mod tests {
             app_user_model_id_from_launch_path("C:\\Tools\\App.exe"),
             None
         );
+        assert!(uses_registered_app_activation(&launch_path));
+        assert!(!uses_registered_app_activation("C:\\Tools\\App.exe"));
     }
 
     #[test]
