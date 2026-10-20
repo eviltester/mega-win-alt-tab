@@ -19,9 +19,9 @@ the source code and build it yourself. Do not install releases from anywhere
 other than the official GitHub Releases page for this repository, or from a
 build you created yourself from source.
 
-Mega Win Alt Tab is a native Rust Windows switcher opened with `Ctrl+Alt+Space`.
-It shows switchable top-level windows, live DWM thumbnails, typed search, and
-Chrome tab-title results.
+Mega Win Alt Tab is a native Rust Windows switcher opened with a configurable
+global shortcut (`Ctrl+Alt+Space` by default). It shows switchable top-level
+windows, live DWM thumbnails, typed search, and Chrome tab-title results.
 
 ## Build and Run
 
@@ -29,13 +29,40 @@ Chrome tab-title results.
 cargo run
 ```
 
-Press `Ctrl+Alt+Space` to open the overlay, then type to search.
+Press `Ctrl+Alt+Space` (the default shortcut) to open the overlay, then type to
+search.
 
-When the app is running, it also adds a notification-area icon. Right-click that
-icon to toggle `Run at startup` or choose `Exit` to quit the application. The
-startup option writes a per-user Windows startup entry that launches the app
-with `--startup`. Normal launches show a short splash screen; `--startup`
-launches quietly to the tray. Click the icon to open the switcher.
+When the app is running, it also adds a notification-area icon. Click the icon
+to open the switcher. Right-click it to open the switcher, configure the global
+shortcut, open the app log, copy the log path, toggle `Run at startup`, or exit
+the application. The startup option writes a per-user Windows startup entry
+that launches the app with `--startup`. Normal launches show a short splash
+screen; `--startup` launches quietly to the tray.
+
+The hamburger button in the switcher header opens the same menu as right-clicking
+the notification-area icon, including configuration, log, startup, and exit
+commands.
+
+The `Configure` submenu offers several reliable shortcut presets plus
+`Change Shortcut Keys...`. When a custom shortcut is active, its combination is
+shown as a checked `Custom: ...` item in this menu. To change it, choose `Change
+Shortcut Keys...`, hold at least one of Ctrl, Alt, or Shift, and press another
+key in the capture panel. The panel shows the pending combination and remains
+open until you choose `Apply`, press Enter, cancel, or close it. `Apply` and
+Enter save the pending shortcut; `Cancel`, Esc, and `[x]` discard it. Presets
+apply immediately. Applied shortcuts are stored in
+`%LOCALAPPDATA%\MegaWinAltTab\settings.json`. If Windows reports that a shortcut
+is already in use, the app displays a notification, writes the rejected
+shortcut and Windows error to the log, and keeps the previous working shortcut.
+Navigation and action keys used while the overlay is open are currently fixed.
+
+If the configured shortcut is already registered by another application, Mega
+Win Alt Tab keeps running and shows a notification explaining that the hotkey
+is not available. The tray icon remains usable. Runtime diagnostics are written
+to `%LOCALAPPDATA%\MegaWinAltTab\mega-win-alt-tab.log`; use `Open app log file`
+or `Copy log file path` from the tray menu when reporting a tray, hotkey, or
+startup problem. New entries use local system time in
+`YYYY-MM-DD HH:MM:SS` format.
 
 The startup entry stores the exact executable path and file name that was
 running when you enabled `Run at startup`. If you download a new version with a
@@ -56,7 +83,7 @@ GitHub Releases page when clicked. It does not auto-download or install updates.
 
 | Key | What it does |
 | --- | --- |
-| `Ctrl+Alt+Space` | Open or hide the switcher overlay. |
+| Configured shortcut (default `Ctrl+Alt+Space`) | Open or hide the switcher overlay. |
 | Text input | Search window titles, Chrome tab titles, app names, or favorite folders in app mode. |
 | `Backspace` | Delete the last character in the search text. |
 | `Up` | Move selection up. |

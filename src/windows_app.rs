@@ -9,6 +9,7 @@ mod folders;
 mod icons;
 mod input;
 mod monitors;
+mod settings;
 mod startup;
 mod tray;
 mod updates;
@@ -26,6 +27,10 @@ use monitors::{
     enumerate_monitor_screen_numbers, monitor_rect_for_window, move_window_to_monitor,
     move_window_to_screen_number, window_screen_number, MonitorMoveDirection, ScreenAdjustment,
 };
+use settings::{
+    is_modifier_key, load_user_settings, save_user_settings, settings_dir, ActivationHotkey,
+    UserSettings,
+};
 use startup::{
     is_run_at_startup_enabled, legacy_startup_entries, remove_startup_entries, set_run_at_startup,
     LegacyStartupEntry,
@@ -37,16 +42,20 @@ use std::ffi::{c_void, OsStr};
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, sleep};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tray::{
     install_tray_icon, is_tray_context_event, is_tray_icon_message, is_tray_select_event,
-    remove_tray_icon, show_context_menu, show_update_notification, TrayMenuCommand, WM_TRAYICON,
+    remove_tray_icon, show_context_menu, show_context_menu_at,
+    show_hotkey_unavailable_notification, show_log_path_copied_notification,
+    show_update_notification, TrayMenuCommand, WM_TRAYICON,
 };
 use updates::{check_for_update, UpdateInfo};
 use virtual_desktops::{
@@ -55,7 +64,8 @@ use virtual_desktops::{
 };
 use windows::core::{w, Result, PCWSTR, PWSTR, VARIANT};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    CloseHandle, GlobalFree, BOOL, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT,
+    SYSTEMTIME, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmRegisterThumbnail, DwmUnregisterThumbnail,
@@ -63,14 +73,21 @@ use windows::Win32::Graphics::Dwm::{
     DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse,
-    EndPaint, FillRect, InvalidateRect, LineTo, MoveToEx, SelectObject, SetBkMode, SetTextColor,
-    DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
-    DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    BeginPaint, ClientToScreen, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW,
+    Ellipse, EndPaint, FillRect, InvalidateRect, LineTo, MoveToEx, SelectObject, SetBkMode,
+    SetTextColor, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
+    DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, PAINTSTRUCT, PS_SOLID,
+    TRANSPARENT,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+    COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
 };
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
@@ -82,9 +99,9 @@ use windows::Win32::UI::Accessibility::{
     UIA_TabItemControlTypeId,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, RegisterHotKey, SetFocus, TrackMouseEvent, UnregisterHotKey, MOD_ALT, MOD_CONTROL,
-    MOD_NOREPEAT, TME_LEAVE, TRACKMOUSEEVENT, VK_BACK, VK_CONTROL, VK_D, VK_DOWN, VK_ESCAPE,
-    VK_HOME, VK_LEFT, VK_NEXT, VK_OEM_2, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
+    GetKeyState, RegisterHotKey, SetFocus, TrackMouseEvent, UnregisterHotKey, MOD_NOREPEAT,
+    TME_LEAVE, TRACKMOUSEEVENT, VK_BACK, VK_CONTROL, VK_D, VK_DOWN, VK_ESCAPE, VK_HOME, VK_LEFT,
+    VK_MENU, VK_NEXT, VK_OEM_2, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, IVirtualDesktopManager, ShellExecuteW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -100,10 +117,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONWARNING, MB_YESNO, MENU_ITEM_FLAGS, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
     SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DROPFILES,
-    WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCHITTEST,
-    WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETICON, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
+    WM_DROPFILES, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCHITTEST, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETICON, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 const HOTKEY_ID: i32 = 0x4d57;
@@ -112,17 +129,22 @@ const CLOSE_REFRESH_TIMER_ID: usize = 0x4d59;
 const APP_SCAN_TIMER_ID: usize = 0x4d5a;
 const HIGHLIGHT_TIMER_ID: usize = 0x4d5b;
 const UPDATE_CHECK_TIMER_ID: usize = 0x4d5c;
+const ACCESSIBILITY_SCAN_TIMER_ID: usize = 0x4d5d;
+const OVERLAY_REQUEST_RETRY_TIMER_ID: usize = 0x4d5e;
 const SPLASH_DURATION_MS: u32 = 2400;
 const CLOSE_REFRESH_POLL_MS: u32 = 250;
 const CLOSE_REFRESH_ATTEMPTS: u8 = 20;
 const APP_SCAN_POLL_MS: u32 = 100;
 const UPDATE_CHECK_POLL_MS: u32 = 250;
+const ACCESSIBILITY_SCAN_POLL_MS: u32 = 50;
+const OVERLAY_REQUEST_RETRY_MS: u32 = 50;
 const HIGHLIGHT_DURATION_MS: u32 = 900;
 const HIGHLIGHT_SECOND_TAP_MS: u64 = 1600;
 const HIGHLIGHT_BORDER_PX: i32 = 6;
 const WM_MOUSELEAVE_MESSAGE: u32 = 0x02A3;
 const MAX_RESULTS: usize = 8;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CF_UNICODETEXT_FORMAT: u32 = 13;
 const GITHUB_RELEASES_URL: PCWSTR = w!("https://github.com/eviltester/mega-win-alt-tab/releases");
 const KEY_F: u32 = b'F' as u32;
 const KEY_S: u32 = b'S' as u32;
@@ -173,6 +195,8 @@ const THUMBNAIL_SIZES: [ThumbnailSize; 4] = [
 const CLASS_NAME: PCWSTR = w!("MegaWinAltTabOverlay");
 const HIGHLIGHT_CLASS_NAME: PCWSTR = w!("MegaWinAltTabHighlight");
 const WINDOW_TITLE: PCWSTR = w!("Mega Win Alt Tab");
+const WM_OVERLAY_REQUEST: u32 = WM_APP + 2;
+static PENDING_OVERLAY_REQUEST: AtomicUsize = AtomicUsize::new(0);
 
 pub fn run() -> Result<()> {
     let startup_launch = has_startup_arg(env::args_os());
@@ -207,7 +231,13 @@ pub fn run() -> Result<()> {
         let _ = RegisterClassW(&highlight_class);
 
         let bridge = ExtensionBridge::start().map_err(to_win_error)?;
-        let state = Rc::new(RefCell::new(AppState::new(bridge, icon, owns_icon)));
+        let user_settings = load_user_settings();
+        let state = Rc::new(RefCell::new(AppState::new(
+            bridge,
+            icon,
+            owns_icon,
+            user_settings.activation_hotkey,
+        )));
         let raw_state = Rc::into_raw(state);
 
         let hwnd = CreateWindowExW(
@@ -238,14 +268,12 @@ pub fn run() -> Result<()> {
             LPARAM(icon.0 as isize),
         );
 
-        (*raw_state).borrow_mut().install_tray_icon();
-
-        RegisterHotKey(
-            hwnd,
-            HOTKEY_ID,
-            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-            VK_SPACE.0 as u32,
-        )?;
+        {
+            let mut state = (*raw_state).borrow_mut();
+            state.install_tray_icon();
+            log_runtime_issue(&format!("Mega Win Alt Tab {APP_VERSION} started."));
+            state.register_initial_hotkey();
+        }
 
         if !startup_launch {
             (*raw_state).borrow_mut().show_splash();
@@ -265,6 +293,9 @@ struct AppState {
     hwnd: HWND,
     visible: bool,
     splash_visible: bool,
+    shortcut_capture_active: bool,
+    shortcut_capture_candidate: Option<ActivationHotkey>,
+    shortcut_capture_error: Option<String>,
     mode: OverlayMode,
     all_desktops: bool,
     query: String,
@@ -272,11 +303,17 @@ struct AppState {
     thumbnail_size_index: usize,
     app_icon: HICON,
     owns_app_icon: bool,
+    menu_hovered: bool,
     help_hovered: bool,
     close_hovered: bool,
+    shortcut_apply_hovered: bool,
+    shortcut_cancel_hovered: bool,
     mouse_tracking: bool,
+    menu_rect: RECT,
     help_rect: RECT,
     close_rect: RECT,
+    shortcut_apply_rect: RECT,
+    shortcut_cancel_rect: RECT,
     apps: Vec<AppEntry>,
     background_apps: Vec<AppEntry>,
     favorite_folders: Vec<FavoriteFolderEntry>,
@@ -290,6 +327,7 @@ struct AppState {
     update_link_rect: RECT,
     windows: Vec<WindowEntry>,
     accessibility_tabs: Vec<TabEntry>,
+    accessibility_scan_rx: Option<Receiver<Vec<TabEntry>>>,
     results: Vec<SearchResult>,
     thumbnails: HashMap<isize, isize>,
     original_window_rects: HashMap<isize, RECT>,
@@ -300,6 +338,16 @@ struct AppState {
     row_layouts: Vec<RowLayout>,
     bridge: ExtensionBridge,
     tray_icon_installed: bool,
+    activation_hotkey: ActivationHotkey,
+    hotkey_registered: bool,
+    hotkey_suspended_for_capture: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShortcutCaptureClickAction {
+    None,
+    Apply,
+    Cancel,
 }
 
 #[derive(Clone, Copy)]
@@ -319,6 +367,23 @@ struct ThumbnailSize {
 enum OverlayMode {
     WindowsAndTabs,
     Apps,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum OverlayRequest {
+    Show = 1,
+    Toggle = 2,
+}
+
+impl OverlayRequest {
+    fn from_code(code: usize) -> Option<Self> {
+        match code {
+            code if code == Self::Show as usize => Some(Self::Show),
+            code if code == Self::Toggle as usize => Some(Self::Toggle),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,11 +414,19 @@ enum ResultContextMenuCommand {
 }
 
 impl AppState {
-    fn new(bridge: ExtensionBridge, app_icon: HICON, owns_app_icon: bool) -> Self {
+    fn new(
+        bridge: ExtensionBridge,
+        app_icon: HICON,
+        owns_app_icon: bool,
+        activation_hotkey: ActivationHotkey,
+    ) -> Self {
         Self {
             hwnd: HWND(null_mut()),
             visible: false,
             splash_visible: false,
+            shortcut_capture_active: false,
+            shortcut_capture_candidate: None,
+            shortcut_capture_error: None,
             mode: OverlayMode::WindowsAndTabs,
             all_desktops: false,
             query: String::new(),
@@ -361,11 +434,17 @@ impl AppState {
             thumbnail_size_index: 0,
             app_icon,
             owns_app_icon,
+            menu_hovered: false,
             help_hovered: false,
             close_hovered: false,
+            shortcut_apply_hovered: false,
+            shortcut_cancel_hovered: false,
             mouse_tracking: false,
+            menu_rect: RECT::default(),
             help_rect: RECT::default(),
             close_rect: RECT::default(),
+            shortcut_apply_rect: RECT::default(),
+            shortcut_cancel_rect: RECT::default(),
             apps: Vec::new(),
             background_apps: Vec::new(),
             favorite_folders: load_favorite_folders(),
@@ -379,6 +458,7 @@ impl AppState {
             update_link_rect: RECT::default(),
             windows: Vec::new(),
             accessibility_tabs: Vec::new(),
+            accessibility_scan_rx: None,
             results: Vec::new(),
             thumbnails: HashMap::new(),
             original_window_rects: HashMap::new(),
@@ -389,6 +469,9 @@ impl AppState {
             row_layouts: Vec::new(),
             bridge,
             tray_icon_installed: false,
+            activation_hotkey,
+            hotkey_registered: false,
+            hotkey_suspended_for_capture: false,
         }
     }
 
@@ -402,16 +485,88 @@ impl AppState {
         }
     }
 
+    unsafe fn register_initial_hotkey(&mut self) {
+        match register_activation_hotkey(self.hwnd, self.activation_hotkey) {
+            Ok(()) => self.hotkey_registered = true,
+            Err(error) => {
+                log_hotkey_registration_failure(self.activation_hotkey, &error);
+                show_hotkey_unavailable_notification(self.hwnd, &self.activation_hotkey.label());
+            }
+        }
+    }
+
+    unsafe fn set_activation_hotkey(&mut self, hotkey: ActivationHotkey) -> bool {
+        if hotkey == self.activation_hotkey && self.hotkey_registered {
+            return true;
+        }
+
+        let previous = self.activation_hotkey;
+        let previous_was_registered = self.hotkey_registered || self.hotkey_suspended_for_capture;
+        if previous_was_registered {
+            if self.hotkey_registered {
+                let _ = UnregisterHotKey(self.hwnd, HOTKEY_ID);
+            }
+            self.hotkey_registered = false;
+        }
+        self.hotkey_suspended_for_capture = false;
+
+        match register_activation_hotkey(self.hwnd, hotkey) {
+            Ok(()) => {
+                self.activation_hotkey = hotkey;
+                self.hotkey_registered = true;
+                if !save_user_settings(UserSettings {
+                    activation_hotkey: hotkey,
+                }) {
+                    log_runtime_issue("Failed to save the configured activation shortcut.");
+                }
+                log_runtime_issue(&format!(
+                    "Activation shortcut changed to {}.",
+                    hotkey.label()
+                ));
+                if self.splash_visible {
+                    let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+                }
+                true
+            }
+            Err(error) => {
+                log_hotkey_registration_failure(hotkey, &error);
+                show_hotkey_unavailable_notification(self.hwnd, &hotkey.label());
+
+                if previous_was_registered {
+                    if self.shortcut_capture_active {
+                        self.hotkey_suspended_for_capture = true;
+                    } else {
+                        match register_activation_hotkey(self.hwnd, previous) {
+                            Ok(()) => self.hotkey_registered = true,
+                            Err(restore_error) => log_runtime_issue(&format!(
+                                "Could not restore {} after shortcut configuration failed: {restore_error}",
+                                previous.label()
+                            )),
+                        }
+                    }
+                }
+                false
+            }
+        }
+    }
+
     unsafe fn show(&mut self) {
+        self.resume_hotkey_after_capture();
         self.visible = true;
         self.splash_visible = false;
+        self.shortcut_capture_active = false;
+        self.shortcut_capture_candidate = None;
+        self.shortcut_capture_error = None;
+        self.menu_hovered = false;
         let _ = KillTimer(self.hwnd, SPLASH_TIMER_ID);
         self.mode = OverlayMode::WindowsAndTabs;
         self.all_desktops = false;
         self.query.clear();
         self.selected = 0;
         self.scan_apps_after_paint = !self.app_scan_completed && self.app_scan_rx.is_none();
-        self.refresh();
+        self.windows.clear();
+        self.accessibility_tabs.clear();
+        self.results.clear();
 
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
@@ -433,12 +588,17 @@ impl AppState {
         let _ = ShowWindow(self.hwnd, SW_SHOW);
         let _ = SetForegroundWindow(self.hwnd);
         let _ = SetFocus(self.hwnd);
+        self.refresh();
         let _ = InvalidateRect(self.hwnd, None, BOOL(1));
     }
 
     unsafe fn show_splash(&mut self) {
         self.visible = true;
         self.splash_visible = true;
+        self.shortcut_capture_active = false;
+        self.shortcut_capture_candidate = None;
+        self.shortcut_capture_error = None;
+        self.menu_hovered = false;
         self.help_hovered = false;
         self.close_hovered = false;
 
@@ -466,28 +626,94 @@ impl AppState {
         let _ = InvalidateRect(self.hwnd, None, BOOL(1));
     }
 
+    unsafe fn show_shortcut_capture(&mut self) {
+        if self.hotkey_registered {
+            let _ = UnregisterHotKey(self.hwnd, HOTKEY_ID);
+            self.hotkey_registered = false;
+            self.hotkey_suspended_for_capture = true;
+        }
+        self.visible = true;
+        self.splash_visible = false;
+        self.shortcut_capture_active = true;
+        self.shortcut_capture_candidate = None;
+        self.shortcut_capture_error = None;
+        self.menu_hovered = false;
+        self.help_hovered = false;
+        self.close_hovered = false;
+        self.shortcut_apply_hovered = false;
+        self.shortcut_cancel_hovered = false;
+        self.results.clear();
+        self.row_layouts.clear();
+        self.unregister_thumbnails();
+
+        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+        let width = 620;
+        let height = 330;
+        let left = (screen_w - width) / 2;
+        let top = (screen_h - height) / 3;
+
+        SetWindowPos(
+            self.hwnd,
+            HWND_TOPMOST,
+            left,
+            top,
+            width,
+            height,
+            SET_WINDOW_POS_FLAGS(0),
+        )
+        .ok();
+        let _ = ShowWindow(self.hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(self.hwnd);
+        let _ = SetFocus(self.hwnd);
+        let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+    }
+
     unsafe fn hide(&mut self) {
+        self.resume_hotkey_after_capture();
         self.visible = false;
         self.splash_visible = false;
+        self.shortcut_capture_active = false;
+        self.shortcut_capture_candidate = None;
+        self.shortcut_capture_error = None;
         let _ = KillTimer(self.hwnd, SPLASH_TIMER_ID);
         self.mode = OverlayMode::WindowsAndTabs;
         self.all_desktops = false;
         self.query.clear();
         self.selected = 0;
+        self.menu_hovered = false;
         self.help_hovered = false;
         self.close_hovered = false;
+        self.shortcut_apply_hovered = false;
+        self.shortcut_cancel_hovered = false;
         self.mouse_tracking = false;
         self.results.clear();
         self.row_layouts.clear();
         self.original_window_rects.clear();
         self.pending_close_windows.clear();
         self.scan_apps_after_paint = false;
+        self.accessibility_scan_rx = None;
         self.last_peek_target = None;
         self.last_peek_at = None;
         let _ = KillTimer(self.hwnd, CLOSE_REFRESH_TIMER_ID);
+        let _ = KillTimer(self.hwnd, ACCESSIBILITY_SCAN_TIMER_ID);
         self.hide_attention_border();
         self.unregister_thumbnails();
         let _ = ShowWindow(self.hwnd, SW_HIDE);
+    }
+
+    unsafe fn resume_hotkey_after_capture(&mut self) {
+        if !self.hotkey_suspended_for_capture {
+            return;
+        }
+        self.hotkey_suspended_for_capture = false;
+        match register_activation_hotkey(self.hwnd, self.activation_hotkey) {
+            Ok(()) => self.hotkey_registered = true,
+            Err(error) => {
+                log_hotkey_registration_failure(self.activation_hotkey, &error);
+                show_hotkey_unavailable_notification(self.hwnd, &self.activation_hotkey.label());
+            }
+        }
     }
 
     unsafe fn toggle(&mut self) {
@@ -500,9 +726,70 @@ impl AppState {
 
     unsafe fn refresh(&mut self) {
         self.unregister_thumbnails();
-        self.windows = enumerate_windows(self.hwnd, self.all_desktops);
-        self.accessibility_tabs = scan_chrome_tabs(&self.windows);
+        self.windows = catch_unwind(AssertUnwindSafe(|| {
+            enumerate_windows(self.hwnd, self.all_desktops)
+        }))
+        .unwrap_or_else(|_| {
+            log_runtime_issue("Recovered from a panic while refreshing the window list.");
+            Vec::new()
+        });
+        self.accessibility_tabs.clear();
         self.rebuild_results();
+        self.start_accessibility_scan();
+    }
+
+    unsafe fn start_accessibility_scan(&mut self) {
+        if !self
+            .windows
+            .iter()
+            .any(|window| window.class_name == "Chrome_WidgetWin_1")
+        {
+            self.accessibility_scan_rx = None;
+            let _ = KillTimer(self.hwnd, ACCESSIBILITY_SCAN_TIMER_ID);
+            return;
+        }
+
+        let windows = self.windows.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.accessibility_scan_rx = Some(receiver);
+        let _ = SetTimer(
+            self.hwnd,
+            ACCESSIBILITY_SCAN_TIMER_ID,
+            ACCESSIBILITY_SCAN_POLL_MS,
+            None,
+        );
+        let _ = thread::spawn(move || {
+            let tabs = scan_chrome_tabs_on_worker(&windows);
+            let _ = sender.send(tabs);
+        });
+    }
+
+    unsafe fn poll_accessibility_scan(&mut self) {
+        let Some(scan_result) = self
+            .accessibility_scan_rx
+            .as_ref()
+            .map(|receiver| receiver.try_recv())
+        else {
+            return;
+        };
+
+        match scan_result {
+            Ok(tabs) => {
+                self.accessibility_tabs = tabs;
+                self.accessibility_scan_rx = None;
+                let _ = KillTimer(self.hwnd, ACCESSIBILITY_SCAN_TIMER_ID);
+                self.rebuild_results();
+                if self.visible && !self.splash_visible {
+                    let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.accessibility_scan_rx = None;
+                let _ = KillTimer(self.hwnd, ACCESSIBILITY_SCAN_TIMER_ID);
+                log_runtime_issue("Chrome accessibility scan stopped before returning results.");
+            }
+            Err(TryRecvError::Empty) => {}
+        }
     }
 
     unsafe fn start_app_scan_if_needed(&mut self) {
@@ -627,7 +914,7 @@ impl AppState {
     }
 
     unsafe fn on_char(&mut self, ch: char) {
-        if !self.visible || self.splash_visible {
+        if !self.visible || self.splash_visible || self.shortcut_capture_active {
             return;
         }
         if is_control_down() {
@@ -643,6 +930,10 @@ impl AppState {
 
     unsafe fn on_key_down(&mut self, key: u32) -> DeferredAction {
         if !self.visible {
+            return DeferredAction::None;
+        }
+        if self.shortcut_capture_active {
+            self.on_shortcut_capture_key(key);
             return DeferredAction::None;
         }
         let ctrl_down = is_control_down();
@@ -716,6 +1007,50 @@ impl AppState {
         DeferredAction::None
     }
 
+    unsafe fn on_shortcut_capture_key(&mut self, key: u32) {
+        if key == VK_ESCAPE.0 as u32 {
+            self.hide();
+            return;
+        }
+        if is_modifier_key(key) {
+            return;
+        }
+
+        let ctrl = is_virtual_key_down(VK_CONTROL.0 as i32);
+        let alt = is_virtual_key_down(VK_MENU.0 as i32);
+        let shift = is_virtual_key_down(VK_SHIFT.0 as i32);
+        if key == VK_RETURN.0 as u32 && !ctrl && !alt && !shift {
+            self.apply_shortcut_capture();
+            return;
+        }
+
+        let Some(hotkey) = ActivationHotkey::custom(ctrl, alt, shift, key) else {
+            self.shortcut_capture_error =
+                Some("Hold Ctrl, Alt, or Shift while pressing the shortcut key.".to_string());
+            let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+            return;
+        };
+
+        self.shortcut_capture_candidate = Some(hotkey);
+        self.shortcut_capture_error = None;
+        let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+    }
+
+    unsafe fn apply_shortcut_capture(&mut self) {
+        let Some(hotkey) = self.shortcut_capture_candidate else {
+            return;
+        };
+        let label = hotkey.label();
+        if self.set_activation_hotkey(hotkey) {
+            self.hide();
+        } else {
+            self.shortcut_capture_error = Some(format!(
+                "Could not register {label}. It may already be in use."
+            ));
+            let _ = InvalidateRect(self.hwnd, None, BOOL(1));
+        }
+    }
+
     unsafe fn toggle_app_mode(&mut self) {
         self.mode = match self.mode {
             OverlayMode::WindowsAndTabs => {
@@ -745,6 +1080,9 @@ impl AppState {
 
     fn empty_message(&self) -> &'static str {
         match (self.mode, self.all_desktops) {
+            (OverlayMode::WindowsAndTabs, _) if self.accessibility_scan_rx.is_some() => {
+                "Scanning windows and Chrome tabs..."
+            }
             (OverlayMode::WindowsAndTabs, false) => "No matching windows or Chrome tabs",
             (OverlayMode::WindowsAndTabs, true) => {
                 "No matching windows or Chrome tabs on any desktop"
@@ -1056,7 +1394,9 @@ impl AppState {
         let _ = GetClientRect(self.hwnd, &mut rect);
 
         fill_rect(hdc, rect, rgb(24, 26, 27));
-        if self.splash_visible {
+        if self.shortcut_capture_active {
+            self.draw_shortcut_capture(hdc, rect);
+        } else if self.splash_visible {
             self.draw_splash(hdc, rect);
         } else {
             self.draw_search(hdc, rect);
@@ -1073,6 +1413,164 @@ impl AppState {
         }
 
         let _ = EndPaint(self.hwnd, &ps);
+    }
+
+    unsafe fn draw_shortcut_capture(&mut self, hdc: HDC, rect: RECT) {
+        self.help_rect = RECT::default();
+        self.update_link_rect = RECT::default();
+        self.row_layouts.clear();
+        self.close_rect = RECT {
+            left: rect.right - 56,
+            top: rect.top + 18,
+            right: rect.right - 20,
+            bottom: rect.top + 54,
+        };
+        self.shortcut_apply_rect = RECT {
+            left: rect.right - 150,
+            top: rect.bottom - 58,
+            right: rect.right - 30,
+            bottom: rect.bottom - 18,
+        };
+        self.shortcut_cancel_rect = RECT {
+            left: self.shortcut_apply_rect.left - 134,
+            top: self.shortcut_apply_rect.top,
+            right: self.shortcut_apply_rect.left - 14,
+            bottom: self.shortcut_apply_rect.bottom,
+        };
+        draw_close_button(hdc, self.close_rect, self.close_hovered);
+
+        let icon_size = 42;
+        let icon_left = rect.left + 30;
+        let icon_top = rect.top + 24;
+        let _ = DrawIconEx(
+            hdc,
+            icon_left,
+            icon_top,
+            self.app_icon,
+            icon_size,
+            icon_size,
+            0,
+            HBRUSH(null_mut()),
+            DI_NORMAL,
+        );
+
+        let title_font = make_font(25, FW_BOLD.0 as i32);
+        let old_title = SelectObject(hdc, title_font);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, rgb(247, 250, 252));
+        draw_text(
+            hdc,
+            "Configure shortcut",
+            RECT {
+                left: icon_left + icon_size + 16,
+                top: rect.top + 22,
+                right: self.close_rect.left - 12,
+                bottom: rect.top + 68,
+            },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        SelectObject(hdc, old_title);
+        let _ = DeleteObject(title_font);
+
+        let body_font = make_font(17, FW_NORMAL.0 as i32);
+        let old_body = SelectObject(hdc, body_font);
+        SetTextColor(hdc, rgb(225, 229, 233));
+        draw_text(
+            hdc,
+            "Hold Ctrl, Alt, or Shift, then press another key.",
+            RECT {
+                left: rect.left + 30,
+                top: rect.top + 92,
+                right: rect.right - 30,
+                bottom: rect.top + 122,
+            },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        SetTextColor(hdc, rgb(166, 176, 186));
+        draw_text(
+            hdc,
+            &format!("Current shortcut: {}", self.activation_hotkey.label()),
+            RECT {
+                left: rect.left + 30,
+                top: rect.top + 126,
+                right: rect.right - 30,
+                bottom: rect.top + 154,
+            },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        let pending_rect = RECT {
+            left: rect.left + 30,
+            top: rect.top + 164,
+            right: rect.right - 30,
+            bottom: rect.top + 204,
+        };
+        fill_rect(hdc, pending_rect, rgb(40, 44, 48));
+        draw_rect_outline(hdc, pending_rect, rgb(82, 91, 101));
+        SetTextColor(
+            hdc,
+            if self.shortcut_capture_candidate.is_some() {
+                rgb(247, 250, 252)
+            } else {
+                rgb(156, 166, 176)
+            },
+        );
+        draw_text(
+            hdc,
+            &shortcut_candidate_text(self.shortcut_capture_candidate),
+            RECT {
+                left: pending_rect.left + 12,
+                top: pending_rect.top,
+                right: pending_rect.right - 12,
+                bottom: pending_rect.bottom,
+            },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        if let Some(error) = &self.shortcut_capture_error {
+            SetTextColor(hdc, rgb(255, 168, 128));
+            draw_text(
+                hdc,
+                error,
+                RECT {
+                    left: rect.left + 30,
+                    top: rect.top + 212,
+                    right: rect.right - 30,
+                    bottom: rect.top + 258,
+                },
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+        } else {
+            SetTextColor(hdc, rgb(156, 166, 176));
+            draw_text(
+                hdc,
+                "Apply or Enter saves. X, Esc, or Cancel discards.",
+                RECT {
+                    left: rect.left + 30,
+                    top: rect.top + 212,
+                    right: rect.right - 30,
+                    bottom: rect.top + 258,
+                },
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+        }
+        SelectObject(hdc, old_body);
+        let _ = DeleteObject(body_font);
+
+        draw_command_button(
+            hdc,
+            self.shortcut_cancel_rect,
+            "Cancel",
+            self.shortcut_cancel_hovered,
+            false,
+            true,
+        );
+        draw_command_button(
+            hdc,
+            self.shortcut_apply_rect,
+            "Apply",
+            self.shortcut_apply_hovered,
+            true,
+            self.shortcut_capture_candidate.is_some(),
+        );
     }
 
     unsafe fn draw_splash(&self, hdc: HDC, rect: RECT) {
@@ -1129,9 +1627,10 @@ impl AppState {
         let hint_font = make_font(16, FW_NORMAL.0 as i32);
         let old_hint = SelectObject(hdc, hint_font);
         SetTextColor(hdc, rgb(232, 236, 241));
+        let shortcut_hint = format!("{} opens the switcher", self.activation_hotkey.label());
         draw_text(
             hdc,
-            "Ctrl+Alt+Space opens the switcher",
+            &shortcut_hint,
             RECT {
                 left: rect.left + 34,
                 top: rect.top + 126,
@@ -1185,8 +1684,10 @@ impl AppState {
         );
 
         let buttons = search_button_rects(search_rect);
+        self.menu_rect = buttons.menu;
         self.help_rect = buttons.help;
         self.close_rect = buttons.close;
+        draw_menu_button(hdc, self.menu_rect, self.menu_hovered);
         draw_help_button(hdc, self.help_rect, self.help_hovered);
         draw_close_button(hdc, self.close_rect, self.close_hovered);
 
@@ -1215,7 +1716,7 @@ impl AppState {
             RECT {
                 left: icon_rect.right + 14,
                 top: search_rect.top,
-                right: self.help_rect.left - 14,
+                right: self.menu_rect.left - 14,
                 bottom: search_rect.bottom,
             },
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
@@ -1478,9 +1979,10 @@ impl AppState {
     }
 
     unsafe fn draw_help_tooltip(&self, hdc: HDC, rect: RECT) {
+        let help_lines = help_lines(self.activation_hotkey);
         let line_height = 22;
         let width = 382;
-        let height = 18 + (HELP_LINES.len() as i32 * line_height);
+        let height = 18 + (help_lines.len() as i32 * line_height);
         let right = (self.help_rect.right + 6).min(rect.right - 28);
         let left = (right - width).max(rect.left + 28);
         let top = self.help_rect.bottom + 8;
@@ -1498,7 +2000,7 @@ impl AppState {
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, rgb(238, 241, 243));
-        for (index, line) in HELP_LINES.iter().enumerate() {
+        for (index, line) in help_lines.iter().enumerate() {
             let line_top = tooltip.top + 9 + index as i32 * line_height;
             draw_text(
                 hdc,
@@ -1589,40 +2091,85 @@ impl AppState {
             self.mouse_tracking = TrackMouseEvent(&mut event).is_ok();
         }
 
+        let menu_hovered = !self.splash_visible
+            && !self.shortcut_capture_active
+            && point_in_rect(self.menu_rect, x, y);
         let help_hovered = point_in_rect(self.help_rect, x, y);
         let close_hovered = point_in_rect(self.close_rect, x, y);
+        let shortcut_apply_hovered = self.shortcut_capture_active
+            && self.shortcut_capture_candidate.is_some()
+            && point_in_rect(self.shortcut_apply_rect, x, y);
+        let shortcut_cancel_hovered =
+            self.shortcut_capture_active && point_in_rect(self.shortcut_cancel_rect, x, y);
         let update_link_hovered =
             self.available_update.is_some() && point_in_rect(self.update_link_rect, x, y);
-        if help_hovered != self.help_hovered
+        if menu_hovered != self.menu_hovered
+            || help_hovered != self.help_hovered
             || close_hovered != self.close_hovered
+            || shortcut_apply_hovered != self.shortcut_apply_hovered
+            || shortcut_cancel_hovered != self.shortcut_cancel_hovered
             || update_link_hovered != self.update_link_hovered
         {
+            self.menu_hovered = menu_hovered;
             self.help_hovered = help_hovered;
             self.close_hovered = close_hovered;
+            self.shortcut_apply_hovered = shortcut_apply_hovered;
+            self.shortcut_cancel_hovered = shortcut_cancel_hovered;
             self.update_link_hovered = update_link_hovered;
             let _ = InvalidateRect(self.hwnd, None, BOOL(1));
         }
     }
 
-    unsafe fn on_left_button_up(&mut self, x: i32, y: i32) {
+    unsafe fn on_left_button_up(&mut self, x: i32, y: i32) -> Option<POINT> {
+        if !self.visible {
+            return None;
+        }
+        if self.shortcut_capture_active {
+            match shortcut_capture_click_action(
+                self.close_rect,
+                self.shortcut_cancel_rect,
+                self.shortcut_apply_rect,
+                self.shortcut_capture_candidate.is_some(),
+                x,
+                y,
+            ) {
+                ShortcutCaptureClickAction::Apply => {
+                    self.apply_shortcut_capture();
+                }
+                ShortcutCaptureClickAction::Cancel => {
+                    self.hide();
+                }
+                ShortcutCaptureClickAction::None => {}
+            }
+            return None;
+        }
+        if !self.splash_visible && point_in_rect(self.menu_rect, x, y) {
+            return Some(POINT {
+                x: self.menu_rect.left,
+                y: self.menu_rect.bottom + 4,
+            });
+        }
         if self.visible
             && self.available_update.is_some()
             && point_in_rect(self.update_link_rect, x, y)
         {
             open_github_releases(self.hwnd);
-            return;
+            return None;
         }
-        if self.visible && point_in_rect(self.close_rect, x, y) {
+        if point_in_rect(self.close_rect, x, y) {
             self.hide();
-            return;
+            return None;
         }
-        if self.visible {
-            self.select_result_at(x, y);
-        }
+        self.select_result_at(x, y);
+        None
     }
 
     unsafe fn on_left_button_double_click(&mut self, x: i32, y: i32) -> DeferredAction {
-        if !self.visible || self.splash_visible || !self.select_result_at(x, y) {
+        if !self.visible
+            || self.splash_visible
+            || self.shortcut_capture_active
+            || !self.select_result_at(x, y)
+        {
             return DeferredAction::None;
         }
 
@@ -1648,7 +2195,11 @@ impl AppState {
         x: i32,
         y: i32,
     ) -> Option<ResultContextMenuRequest> {
-        if !self.visible || self.splash_visible || !self.select_result_at(x, y) {
+        if !self.visible
+            || self.splash_visible
+            || self.shortcut_capture_active
+            || !self.select_result_at(x, y)
+        {
             return None;
         }
 
@@ -1750,9 +2301,18 @@ impl AppState {
 
     unsafe fn on_mouse_leave(&mut self) {
         self.mouse_tracking = false;
-        if self.help_hovered || self.close_hovered || self.update_link_hovered {
+        if self.menu_hovered
+            || self.help_hovered
+            || self.close_hovered
+            || self.shortcut_apply_hovered
+            || self.shortcut_cancel_hovered
+            || self.update_link_hovered
+        {
+            self.menu_hovered = false;
             self.help_hovered = false;
             self.close_hovered = false;
+            self.shortcut_apply_hovered = false;
+            self.shortcut_cancel_hovered = false;
             self.update_link_hovered = false;
             let _ = InvalidateRect(self.hwnd, None, BOOL(1));
         }
@@ -1767,7 +2327,9 @@ impl Drop for AppState {
             self.destroy_highlight_windows();
             if !self.hwnd.0.is_null() {
                 DragAcceptFiles(self.hwnd, false);
-                let _ = UnregisterHotKey(self.hwnd, HOTKEY_ID);
+                if self.hotkey_registered {
+                    let _ = UnregisterHotKey(self.hwnd, HOTKEY_ID);
+                }
             }
             if self.owns_app_icon {
                 let _ = DestroyIcon(self.app_icon);
@@ -1911,6 +2473,52 @@ unsafe extern "system" fn highlight_wnd_proc(
     }
 }
 
+fn queue_overlay_request(hwnd: HWND, request: OverlayRequest) {
+    PENDING_OVERLAY_REQUEST.store(request as usize, Ordering::Release);
+    if unsafe {
+        PostMessageW(
+            hwnd,
+            WM_OVERLAY_REQUEST,
+            WPARAM(request as usize),
+            LPARAM(0),
+        )
+    }
+    .is_err()
+    {
+        log_runtime_issue("Failed to queue a request to open the overlay.");
+    }
+}
+
+unsafe fn process_overlay_request(hwnd: HWND, state_ptr: *const RefCell<AppState>) {
+    let code = PENDING_OVERLAY_REQUEST.swap(0, Ordering::AcqRel);
+    let Some(request) = OverlayRequest::from_code(code) else {
+        return;
+    };
+
+    let state = &*state_ptr;
+    let Ok(mut state) = state.try_borrow_mut() else {
+        let _ = PENDING_OVERLAY_REQUEST.compare_exchange(
+            0,
+            request as usize,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let _ = SetTimer(
+            hwnd,
+            OVERLAY_REQUEST_RETRY_TIMER_ID,
+            OVERLAY_REQUEST_RETRY_MS,
+            None,
+        );
+        return;
+    };
+
+    let _ = KillTimer(hwnd, OVERLAY_REQUEST_RETRY_TIMER_ID);
+    match request {
+        OverlayRequest::Show => state.show(),
+        OverlayRequest::Toggle => state.toggle(),
+    }
+}
+
 unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if message == WM_NCCREATE {
         let create = lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW;
@@ -1926,27 +2534,27 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
     }
 
     match message {
+        WM_OVERLAY_REQUEST => {
+            process_overlay_request(hwnd, state_ptr);
+            return LRESULT(0);
+        }
         WM_HOTKEY => {
             if wparam.0 as i32 == HOTKEY_ID {
-                with_state_mut(state_ptr, "toggle overlay from hotkey", (), |state| {
-                    state.toggle()
-                });
+                queue_overlay_request(hwnd, OverlayRequest::Toggle);
                 return LRESULT(0);
             }
         }
         WM_TRAYICON => {
             if is_tray_icon_message(wparam, lparam) {
                 if is_tray_select_event(lparam) {
-                    with_state_mut(state_ptr, "show overlay from tray icon", (), |state| {
-                        state.show()
-                    });
+                    queue_overlay_request(hwnd, OverlayRequest::Show);
                 } else if is_tray_context_event(lparam) {
-                    handle_tray_menu_command(hwnd);
+                    handle_app_menu_command(hwnd, state_ptr, None);
                 }
             }
             return LRESULT(0);
         }
-        WM_KEYDOWN => {
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
             let action = with_state_mut(
                 state_ptr,
                 "handle key press",
@@ -1981,9 +2589,14 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
         }
         WM_LBUTTONUP => {
             let (x, y) = mouse_point(lparam);
-            with_state_mut(state_ptr, "handle left click", (), |state| {
+            let menu_position = with_state_mut(state_ptr, "handle left click", None, |state| {
                 state.on_left_button_up(x, y)
             });
+            if let Some(mut position) = menu_position {
+                if ClientToScreen(hwnd, &mut position).as_bool() {
+                    handle_app_menu_command(hwnd, state_ptr, Some(position));
+                }
+            }
             return LRESULT(0);
         }
         WM_LBUTTONDBLCLK => {
@@ -2027,7 +2640,7 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
                     |state| state.handle_result_context_menu_command(command),
                 )
             } else {
-                handle_tray_menu_command(hwnd);
+                handle_app_menu_command(hwnd, state_ptr, None);
                 DeferredAction::None
             };
             let outcome = action.run();
@@ -2065,7 +2678,7 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
                     |state| state.handle_result_context_menu_command(command),
                 )
             } else {
-                handle_tray_menu_command(hwnd);
+                handle_app_menu_command(hwnd, state_ptr, None);
                 DeferredAction::None
             };
             let outcome = action.run();
@@ -2089,6 +2702,7 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
             }
             return LRESULT(0);
         }
+        WM_SYSCHAR => return LRESULT(0),
         WM_PAINT => {
             with_state_mut(state_ptr, "paint overlay", (), |state| state.paint());
             return LRESULT(0);
@@ -2126,6 +2740,16 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
                 });
                 return LRESULT(0);
             }
+            if wparam.0 == ACCESSIBILITY_SCAN_TIMER_ID {
+                with_state_mut(state_ptr, "poll Chrome accessibility scan", (), |state| {
+                    state.poll_accessibility_scan()
+                });
+                return LRESULT(0);
+            }
+            if wparam.0 == OVERLAY_REQUEST_RETRY_TIMER_ID {
+                process_overlay_request(hwnd, state_ptr);
+                return LRESULT(0);
+            }
         }
         WM_DESTROY => {
             let state = Rc::from_raw(state_ptr);
@@ -2143,9 +2767,56 @@ unsafe fn wnd_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
     DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
-unsafe fn handle_tray_menu_command(hwnd: HWND) {
-    match show_context_menu(hwnd, is_run_at_startup_enabled()) {
+unsafe fn handle_app_menu_command(
+    hwnd: HWND,
+    state_ptr: *const RefCell<AppState>,
+    position: Option<POINT>,
+) {
+    let activation_hotkey = with_state_mut(
+        state_ptr,
+        "read configured activation shortcut",
+        ActivationHotkey::default(),
+        |state| state.activation_hotkey,
+    );
+    let command = match position {
+        Some(position) => show_context_menu_at(
+            hwnd,
+            is_run_at_startup_enabled(),
+            activation_hotkey,
+            Some(position),
+        ),
+        None => show_context_menu(hwnd, is_run_at_startup_enabled(), activation_hotkey),
+    };
+    match command {
         TrayMenuCommand::None => {}
+        TrayMenuCommand::Open => queue_overlay_request(hwnd, OverlayRequest::Show),
+        TrayMenuCommand::OpenLogFile => {
+            if !open_runtime_log(hwnd) {
+                log_runtime_issue("Failed to open the app log file.");
+            }
+        }
+        TrayMenuCommand::CopyLogFilePath => match ensure_runtime_log_file() {
+            Ok(path) => {
+                if copy_text_to_clipboard(hwnd, path.as_os_str()) {
+                    show_log_path_copied_notification(hwnd);
+                } else {
+                    log_runtime_issue("Failed to copy the app log file path to the clipboard.");
+                }
+            }
+            Err(error) => log_runtime_issue(&format!(
+                "Failed to create the app log file before copying its path: {error}"
+            )),
+        },
+        TrayMenuCommand::SetActivationHotkey(hotkey) => {
+            with_state_mut(state_ptr, "configure activation shortcut", (), |state| {
+                let _ = state.set_activation_hotkey(hotkey);
+            });
+        }
+        TrayMenuCommand::CaptureActivationHotkey => {
+            with_state_mut(state_ptr, "open custom shortcut capture", (), |state| {
+                state.show_shortcut_capture()
+            });
+        }
         TrayMenuCommand::ToggleStartup => {
             let enabled = is_run_at_startup_enabled();
             if !enabled {
@@ -2353,7 +3024,9 @@ unsafe fn with_state_mut<T>(
 ) -> T {
     let state = &*state_ptr;
     let Ok(mut state) = state.try_borrow_mut() else {
-        log_runtime_issue(&format!("Skipped {context}: app state was already busy."));
+        if context != "paint overlay" {
+            log_runtime_issue(&format!("Skipped {context}: app state was already busy."));
+        }
         return fallback;
     };
 
@@ -2361,24 +3034,113 @@ unsafe fn with_state_mut<T>(
 }
 
 fn log_runtime_issue(message: &str) {
-    let dir = runtime_log_dir();
-    if create_dir_all(&dir).is_err() {
+    let Ok(path) = ensure_runtime_log_file() else {
         return;
-    }
-
-    let path = dir.join("mega-win-alt-tab.log");
+    };
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
 
-    let _ = writeln!(file, "{:?} {}", SystemTime::now(), message);
+    let timestamp = local_log_timestamp();
+    let _ = writeln!(file, "{timestamp} {message}");
 }
 
-fn runtime_log_dir() -> PathBuf {
-    env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir)
-        .join("MegaWinAltTab")
+fn local_log_timestamp() -> String {
+    format_log_timestamp(unsafe { GetLocalTime() })
+}
+
+fn format_log_timestamp(time: SYSTEMTIME) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
+    )
+}
+
+fn runtime_log_path() -> PathBuf {
+    settings_dir().join("mega-win-alt-tab.log")
+}
+
+fn ensure_runtime_log_file() -> std::io::Result<PathBuf> {
+    let path = runtime_log_path();
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
+    OpenOptions::new().create(true).append(true).open(&path)?;
+    Ok(path)
+}
+
+unsafe fn open_runtime_log(hwnd: HWND) -> bool {
+    let Ok(path) = ensure_runtime_log_file() else {
+        return false;
+    };
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = ShellExecuteW(
+        hwnd,
+        w!("open"),
+        PCWSTR(path.as_ptr()),
+        PCWSTR::null(),
+        PCWSTR::null(),
+        SW_SHOWNORMAL,
+    );
+    result.0 as isize > 32
+}
+
+unsafe fn copy_text_to_clipboard(hwnd: HWND, text: &OsStr) -> bool {
+    let text = text
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let Ok(memory) = GlobalAlloc(GMEM_MOVEABLE, text.len() * size_of::<u16>()) else {
+        return false;
+    };
+
+    let destination = GlobalLock(memory).cast::<u16>();
+    if destination.is_null() {
+        let _ = GlobalFree(memory);
+        return false;
+    }
+    std::ptr::copy_nonoverlapping(text.as_ptr(), destination, text.len());
+    let _ = GlobalUnlock(memory);
+
+    if OpenClipboard(hwnd).is_err() {
+        let _ = GlobalFree(memory);
+        return false;
+    }
+
+    let copied = EmptyClipboard().is_ok()
+        && SetClipboardData(CF_UNICODETEXT_FORMAT, HANDLE(memory.0)).is_ok();
+    let _ = CloseClipboard();
+    if !copied {
+        let _ = GlobalFree(memory);
+    }
+    copied
+}
+
+unsafe fn register_activation_hotkey(hwnd: HWND, hotkey: ActivationHotkey) -> Result<()> {
+    RegisterHotKey(
+        hwnd,
+        HOTKEY_ID,
+        hotkey.modifiers() | MOD_NOREPEAT,
+        hotkey.virtual_key(),
+    )
+}
+
+fn log_hotkey_registration_failure(hotkey: ActivationHotkey, error: &windows::core::Error) {
+    log_runtime_issue(&hotkey_registration_failure_message(hotkey, error));
+}
+
+fn hotkey_registration_failure_message(
+    hotkey: ActivationHotkey,
+    error: &windows::core::Error,
+) -> String {
+    format!(
+        "Could not register {}: {error}. Use the tray icon to open the switcher.",
+        hotkey.label()
+    )
 }
 
 unsafe fn enumerate_windows(self_hwnd: HWND, include_all_desktops: bool) -> Vec<WindowEntry> {
@@ -2689,6 +3451,38 @@ unsafe fn query_process_name(process: HANDLE) -> String {
         .and_then(|stem| stem.to_str())
         .unwrap_or(&path)
         .to_string()
+}
+
+struct UiAutomationApartment;
+
+impl UiAutomationApartment {
+    fn initialize() -> Option<Self> {
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+                .is_ok()
+                .then_some(Self)
+        }
+    }
+}
+
+impl Drop for UiAutomationApartment {
+    fn drop(&mut self) {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+}
+
+fn scan_chrome_tabs_on_worker(windows: &[WindowEntry]) -> Vec<TabEntry> {
+    let Some(_apartment) = UiAutomationApartment::initialize() else {
+        log_runtime_issue("Could not initialize COM for the Chrome accessibility scan.");
+        return Vec::new();
+    };
+
+    catch_unwind(AssertUnwindSafe(|| unsafe { scan_chrome_tabs(windows) })).unwrap_or_else(|_| {
+        log_runtime_issue("Recovered from a panic while scanning Chrome tabs.");
+        Vec::new()
+    })
 }
 
 unsafe fn scan_chrome_tabs(windows: &[WindowEntry]) -> Vec<TabEntry> {
@@ -3237,6 +4031,41 @@ fn update_link_text(latest_version: &str) -> String {
     format!("Update available: {latest_version} - open releases")
 }
 
+fn help_lines(activation_hotkey: ActivationHotkey) -> Vec<String> {
+    let mut lines = HELP_LINES
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect::<Vec<_>>();
+    lines.insert(
+        1,
+        format!("{} - open or hide switcher", activation_hotkey.label()),
+    );
+    lines
+}
+
+fn shortcut_candidate_text(candidate: Option<ActivationHotkey>) -> String {
+    candidate
+        .map(|hotkey| format!("Pending shortcut: {}", hotkey.label()))
+        .unwrap_or_else(|| "Press a shortcut combination".to_string())
+}
+
+fn shortcut_capture_click_action(
+    close_rect: RECT,
+    cancel_rect: RECT,
+    apply_rect: RECT,
+    has_candidate: bool,
+    x: i32,
+    y: i32,
+) -> ShortcutCaptureClickAction {
+    if point_in_rect(close_rect, x, y) || point_in_rect(cancel_rect, x, y) {
+        ShortcutCaptureClickAction::Cancel
+    } else if has_candidate && point_in_rect(apply_rect, x, y) {
+        ShortcutCaptureClickAction::Apply
+    } else {
+        ShortcutCaptureClickAction::None
+    }
+}
+
 fn result_thumbnail_hwnd(result: &SearchResult) -> Option<isize> {
     match &result.target {
         ActivationTarget::Window { hwnd } => Some(*hwnd),
@@ -3257,6 +4086,7 @@ unsafe fn fill_rect(hdc: HDC, rect: RECT, color: COLORREF) {
 
 #[derive(Clone, Copy)]
 struct SearchButtonRects {
+    menu: RECT,
     help: RECT,
     close: RECT,
 }
@@ -3274,8 +4104,14 @@ fn search_button_rects(search_rect: RECT) -> SearchButtonRects {
         right: close.left - 10,
         bottom: close.bottom,
     };
+    let menu = RECT {
+        left: help.left - 38,
+        top: help.top,
+        right: help.left - 10,
+        bottom: help.bottom,
+    };
 
-    SearchButtonRects { help, close }
+    SearchButtonRects { menu, help, close }
 }
 
 unsafe fn draw_rect_outline(hdc: HDC, rect: RECT, color: COLORREF) {
@@ -3286,6 +4122,36 @@ unsafe fn draw_rect_outline(hdc: HDC, rect: RECT, color: COLORREF) {
     let _ = LineTo(hdc, rect.right - 1, rect.bottom - 1);
     let _ = LineTo(hdc, rect.left, rect.bottom - 1);
     let _ = LineTo(hdc, rect.left, rect.top);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(pen);
+}
+
+unsafe fn draw_menu_button(hdc: HDC, rect: RECT, hovered: bool) {
+    fill_rect(
+        hdc,
+        rect,
+        if hovered {
+            rgb(82, 112, 150)
+        } else {
+            rgb(57, 63, 70)
+        },
+    );
+    draw_rect_outline(
+        hdc,
+        rect,
+        if hovered {
+            rgb(172, 205, 242)
+        } else {
+            rgb(120, 130, 141)
+        },
+    );
+
+    let pen = CreatePen(PS_SOLID, 2, rgb(248, 250, 252));
+    let old_pen = SelectObject(hdc, pen);
+    for offset in [9, 14, 19] {
+        let _ = MoveToEx(hdc, rect.left + 7, rect.top + offset, None);
+        let _ = LineTo(hdc, rect.right - 7, rect.top + offset);
+    }
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(pen);
 }
@@ -3356,6 +4222,50 @@ unsafe fn draw_close_button(hdc: HDC, rect: RECT, hovered: bool) {
     let _ = DeleteObject(font);
 }
 
+unsafe fn draw_command_button(
+    hdc: HDC,
+    rect: RECT,
+    label: &str,
+    hovered: bool,
+    primary: bool,
+    enabled: bool,
+) {
+    let fill = match (enabled, primary, hovered) {
+        (false, _, _) => rgb(46, 49, 53),
+        (true, true, true) => rgb(76, 126, 176),
+        (true, true, false) => rgb(58, 102, 146),
+        (true, false, true) => rgb(72, 79, 87),
+        (true, false, false) => rgb(54, 59, 65),
+    };
+    let outline = if enabled {
+        rgb(126, 145, 164)
+    } else {
+        rgb(75, 80, 86)
+    };
+    fill_rect(hdc, rect, fill);
+    draw_rect_outline(hdc, rect, outline);
+
+    let font = make_font(16, FW_BOLD.0 as i32);
+    let old_font = SelectObject(hdc, font);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(
+        hdc,
+        if enabled {
+            rgb(248, 250, 252)
+        } else {
+            rgb(121, 128, 135)
+        },
+    );
+    draw_text(
+        hdc,
+        label,
+        rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    SelectObject(hdc, old_font);
+    let _ = DeleteObject(font);
+}
+
 unsafe fn make_font(height: i32, weight: i32) -> HFONT {
     CreateFontW(
         -height,
@@ -3397,7 +4307,11 @@ fn hwnd_to_isize(hwnd: HWND) -> isize {
 }
 
 unsafe fn is_control_down() -> bool {
-    GetKeyState(VK_CONTROL.0 as i32) < 0
+    is_virtual_key_down(VK_CONTROL.0 as i32)
+}
+
+unsafe fn is_virtual_key_down(virtual_key: i32) -> bool {
+    GetKeyState(virtual_key) < 0
 }
 
 fn visible_result_count(
@@ -3494,6 +4408,20 @@ mod tests {
             minimized: false,
             has_thumbnail: true,
         }
+    }
+
+    #[test]
+    fn overlay_request_codes_accept_only_known_commands() {
+        assert_eq!(
+            OverlayRequest::from_code(OverlayRequest::Show as usize),
+            Some(OverlayRequest::Show)
+        );
+        assert_eq!(
+            OverlayRequest::from_code(OverlayRequest::Toggle as usize),
+            Some(OverlayRequest::Toggle)
+        );
+        assert_eq!(OverlayRequest::from_code(0), None);
+        assert_eq!(OverlayRequest::from_code(99), None);
     }
 
     #[test]
@@ -3865,6 +4793,103 @@ mod tests {
     }
 
     #[test]
+    fn help_text_names_the_configured_activation_shortcut() {
+        let lines = help_lines(ActivationHotkey::CtrlShiftF12);
+
+        assert_eq!(lines[0], format!("Version {APP_VERSION}"));
+        assert_eq!(lines[1], "Ctrl+Shift+F12 - open or hide switcher");
+    }
+
+    #[test]
+    fn shortcut_dialog_text_shows_pending_combination() {
+        assert_eq!(
+            shortcut_candidate_text(None),
+            "Press a shortcut combination"
+        );
+        assert_eq!(
+            shortcut_candidate_text(ActivationHotkey::custom(true, false, true, b'K' as u32)),
+            "Pending shortcut: Ctrl+Shift+K"
+        );
+    }
+
+    #[test]
+    fn shortcut_dialog_close_and_cancel_discard_pending_changes() {
+        let close = RECT {
+            left: 0,
+            top: 0,
+            right: 20,
+            bottom: 20,
+        };
+        let cancel = RECT {
+            left: 30,
+            top: 0,
+            right: 50,
+            bottom: 20,
+        };
+        let apply = RECT {
+            left: 60,
+            top: 0,
+            right: 80,
+            bottom: 20,
+        };
+
+        assert_eq!(
+            shortcut_capture_click_action(close, cancel, apply, true, 10, 10),
+            ShortcutCaptureClickAction::Cancel
+        );
+        assert_eq!(
+            shortcut_capture_click_action(close, cancel, apply, true, 40, 10),
+            ShortcutCaptureClickAction::Cancel
+        );
+        assert_eq!(
+            shortcut_capture_click_action(close, cancel, apply, true, 70, 10),
+            ShortcutCaptureClickAction::Apply
+        );
+        assert_eq!(
+            shortcut_capture_click_action(close, cancel, apply, false, 70, 10),
+            ShortcutCaptureClickAction::None
+        );
+    }
+
+    #[test]
+    fn runtime_log_uses_the_documented_file_name() {
+        assert_eq!(
+            runtime_log_path().file_name().and_then(OsStr::to_str),
+            Some("mega-win-alt-tab.log")
+        );
+    }
+
+    #[test]
+    fn runtime_log_timestamp_is_human_readable_local_time() {
+        let time = SYSTEMTIME {
+            wYear: 2026,
+            wMonth: 10,
+            wDay: 20,
+            wHour: 14,
+            wMinute: 7,
+            wSecond: 9,
+            ..Default::default()
+        };
+
+        assert_eq!(format_log_timestamp(time), "2026-10-20 14:07:09");
+    }
+
+    #[test]
+    fn hotkey_registration_failure_log_names_the_rejected_shortcut() {
+        let error =
+            windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32));
+
+        let message = hotkey_registration_failure_message(
+            ActivationHotkey::custom(true, true, false, b'K' as u32)
+                .expect("Ctrl+Alt+K should be valid"),
+            &error,
+        );
+
+        assert!(message.starts_with("Could not register Ctrl+Alt+K:"));
+        assert!(message.contains("Use the tray icon to open the switcher."));
+    }
+
+    #[test]
     fn selection_status_is_one_based_and_clamped() {
         assert_eq!(selection_status_text(0, 0), "0 / 0");
         assert_eq!(selection_status_text(0, 20), "1 / 20");
@@ -3885,7 +4910,7 @@ mod tests {
     }
 
     #[test]
-    fn search_buttons_keep_help_left_of_close() {
+    fn search_buttons_keep_menu_help_and_close_in_order() {
         let search_rect = RECT {
             left: 28,
             top: 22,
@@ -3895,9 +4920,12 @@ mod tests {
 
         let buttons = search_button_rects(search_rect);
 
-        assert!(buttons.help.left > search_rect.left);
+        assert!(buttons.menu.left > search_rect.left);
+        assert!(buttons.menu.right < buttons.help.left);
         assert!(buttons.help.right < buttons.close.left);
+        assert_eq!(buttons.menu.top, buttons.help.top);
         assert_eq!(buttons.help.top, buttons.close.top);
+        assert_eq!(buttons.menu.bottom, buttons.help.bottom);
         assert_eq!(buttons.help.bottom, buttons.close.bottom);
         assert_eq!(buttons.close.right, search_rect.right - 18);
     }
